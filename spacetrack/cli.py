@@ -12,6 +12,7 @@ import click
 
 from spacetrack import __version__
 from spacetrack.anomaly import decay as decay_mod
+from spacetrack.anomaly import maneuver as maneuver_mod
 from spacetrack.live import live_sample
 from spacetrack.observer.visibility import (
     ObserverLocation,
@@ -28,6 +29,12 @@ from spacetrack.storage import db
 from spacetrack.storage.queries import find_satellite, get_latest_tle
 from spacetrack.storage.snapshot import write_snapshots
 from spacetrack.tle.fetcher import NoNewData, fetch_starlink, now_unix
+from spacetrack.tle.spacetrack_fetcher import (
+    SpaceTrackAuthError,
+    SpaceTrackError,
+    fetch_starlink_for_date,
+    fetch_starlink_for_range,
+)
 
 DEFAULT_DB = Path("data/spacetrack.db")
 
@@ -88,6 +95,63 @@ def update(ctx: click.Context) -> None:
         )
 
     click.echo(f"Fetched {total} Starlink TLEs ({new_count} new since last update).")
+    click.echo(f"Database: {db_path}")
+
+
+@main.command()
+@click.argument("date", type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--days", default=1, type=int, show_default=True,
+              help="Window length in days. Pulls [date, date+days).")
+@click.pass_context
+def backfill(ctx: click.Context, date: datetime, days: int) -> None:
+    """Backfill historical Starlink TLEs from Space-Track for a date range.
+
+    DATE is a UTC calendar day (YYYY-MM-DD). Pulls every Starlink TLE whose
+    epoch falls in [date, date + days). Requires SPACETRACK_IDENTITY and
+    SPACETRACK_PASSWORD env vars set to a Space-Track.org account.
+
+    Idempotent: snapshots dedupe on (norad_id, epoch), so re-running over
+    a window that overlaps existing data only inserts truly new rows.
+    """
+    if days < 1:
+        click.echo("--days must be >= 1.", err=True)
+        sys.exit(2)
+
+    db_path: Path = ctx.obj["db_path"]
+    start = date.replace(tzinfo=timezone.utc)
+    click.echo(
+        f"Backfilling Starlink TLEs from Space-Track: "
+        f"{start.date()} (+{days}d window)..."
+    )
+
+    try:
+        tles = fetch_starlink_for_date(start, window_days=days)
+    except SpaceTrackAuthError as exc:
+        click.echo(f"auth error: {exc}", err=True)
+        sys.exit(1)
+    except SpaceTrackError as exc:
+        click.echo(f"Space-Track error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    if not tles:
+        click.echo(
+            f"No TLEs returned in [{start.date()}, +{days}d). The constellation "
+            "may not have had epochs in that window, or your filter is too narrow."
+        )
+        return
+
+    fetched_at = now_unix()
+    with db.session(db_path) as conn:
+        new_count, total = write_snapshots(
+            conn, tles, fetched_at=fetched_at, constellation="starlink"
+        )
+    click.echo(
+        f"Backfill complete: {total:,} TLEs received, "
+        f"{new_count:,} new (rest were already in the DB)."
+    )
     click.echo(f"Database: {db_path}")
 
 
@@ -641,6 +705,100 @@ def decay(
         click.echo(f"error: no TLE stored for NORAD {norad_id}", err=True)
         sys.exit(1)
     click.echo(_format_assessment(assessment))
+
+
+@main.command()
+@click.argument("identifier", required=False)
+@click.option("--scan", is_flag=True,
+              help="Scan every tracked satellite instead of one IDENTIFIER.")
+@click.option("--min-magnitude",
+              type=click.Choice(["small", "medium", "large"]),
+              default="small", show_default=True,
+              help="Minimum maneuver size to report under --scan.")
+@click.option("--min-delta-km", type=float,
+              default=maneuver_mod.DEFAULT_MIN_DELTA_KM, show_default=True,
+              help="Minimum |Δa| (km) to consider a maneuver vs. noise.")
+@click.option("--max-gap-days", type=float,
+              default=maneuver_mod.DEFAULT_MAX_GAP_DAYS, show_default=True,
+              help="Skip epoch pairs separated by more than this many days.")
+@click.option("--limit", type=int, default=None,
+              help="Cap on --scan results (default: unlimited).")
+@click.pass_context
+def maneuver(
+    ctx: click.Context,
+    identifier: str | None,
+    scan: bool,
+    min_magnitude: str,
+    min_delta_km: float,
+    max_gap_days: float,
+    limit: int | None,
+) -> None:
+    """Detect orbit-raise / orbit-drop maneuvers from TLE mean-motion jumps.
+
+    Without --scan, IDENTIFIER must be a NORAD ID or satellite name and the
+    command prints every detected event in that satellite's history. With
+    --scan, IDENTIFIER is ignored and every tracked Starlink is checked.
+
+    A "maneuver" is a consecutive-epoch pair whose change in semi-major axis
+    exceeds drag's typical ceiling — both in absolute size and per-day rate.
+    """
+    db_path: Path = ctx.obj["db_path"]
+
+    if scan:
+        with db.session(db_path) as conn:
+            events = maneuver_mod.scan(
+                conn,
+                min_magnitude=min_magnitude,  # type: ignore[arg-type]
+                min_delta_km=min_delta_km,
+                max_gap_days=max_gap_days,
+            )
+        if not events:
+            click.echo(f"No maneuvers detected at magnitude >= {min_magnitude}.")
+            return
+        shown = events[:limit] if limit else events
+        click.echo(
+            f"{len(events)} maneuver event(s) at magnitude >= {min_magnitude}"
+            + (f" (showing first {len(shown)})" if limit and len(shown) < len(events) else "")
+            + ":"
+        )
+        click.echo(
+            f"  {'MAG':<7} {'DIR':<5} {'NORAD':>6}  {'NAME':<20} "
+            f"{'Δa(km)':>8} {'rate(km/d)':>11} {'gap(d)':>7}"
+        )
+        for ev in shown:
+            click.echo(
+                f"  {ev.magnitude:<7} {ev.direction:<5} {ev.norad_id:>6}  "
+                f"{ev.name:<20} {ev.delta_a_km:>+8.2f} "
+                f"{ev.delta_a_km_per_day:>+11.3f} {ev.gap_days:>7.2f}"
+            )
+        return
+
+    if not identifier:
+        click.echo("error: provide IDENTIFIER or use --scan", err=True)
+        sys.exit(1)
+
+    with db.session(db_path) as conn:
+        norad_id = find_satellite(conn, identifier)
+        if norad_id is None:
+            click.echo(f"error: no satellite matches {identifier!r}.", err=True)
+            sys.exit(1)
+        events = maneuver_mod.scan_satellite(
+            conn, norad_id,
+            min_delta_km=min_delta_km, max_gap_days=max_gap_days,
+        )
+
+    if not events:
+        click.echo(f"No maneuvers detected for NORAD {norad_id}.")
+        return
+
+    click.echo(f"{len(events)} maneuver event(s) for NORAD {norad_id} ({events[0].name}):")
+    for ev in events:
+        click.echo(
+            f"  [{ev.magnitude}/{ev.direction}] "
+            f"Δa = {ev.delta_a_km:+.2f} km over {ev.gap_days:.2f} d "
+            f"(rate {ev.delta_a_km_per_day:+.3f} km/d) "
+            f"alt {ev.altitude_before_km:.1f} → {ev.altitude_after_km:.1f} km"
+        )
 
 
 if __name__ == "__main__":

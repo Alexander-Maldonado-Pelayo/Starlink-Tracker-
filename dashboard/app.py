@@ -9,7 +9,7 @@ or via the CLI:
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Import spacetrack from the source tree, not from an installed wheel.
@@ -39,8 +39,8 @@ from spacetrack.tle.fetcher import (
     now_unix,
 )
 from spacetrack.anomaly import decay as decay_mod
+from spacetrack.anomaly import maneuver as maneuver_mod
 from spacetrack.viz.globe3d import render_globe
-from spacetrack.viz.globe_deck import render_globe_deck
 from spacetrack.viz.groundtrack import render_ground_track
 from spacetrack.viz.skyplot import HORIZON_DEG, PRACTICAL_DEG, render_sky
 
@@ -161,6 +161,37 @@ def cached_risk_map(bucket_minute: int) -> dict[int, str]:
     with db.session(DB_PATH) as conn:
         flagged = decay_mod.scan(conn, min_risk="elevated")
     return {a.norad_id: a.risk for a in flagged}
+
+
+@st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
+def cached_maneuver_events(min_magnitude: str, bucket_minute: int) -> list[dict]:
+    """Maneuver scan results as plain dicts (cache-safe, table-ready)."""
+    del bucket_minute
+    if not DB_PATH.exists():
+        return []
+    with db.session(DB_PATH) as conn:
+        events = maneuver_mod.scan(conn, min_magnitude=min_magnitude)  # type: ignore[arg-type]
+    return [
+        {
+            "norad_id": e.norad_id,
+            "name": e.name,
+            "epoch_before": e.epoch_before,
+            "epoch_after": e.epoch_after,
+            "gap_days": e.gap_days,
+            "altitude_before_km": e.altitude_before_km,
+            "altitude_after_km": e.altitude_after_km,
+            "delta_a_km": e.delta_a_km,
+            "delta_a_km_per_day": e.delta_a_km_per_day,
+            "direction": e.direction,
+            "magnitude": e.magnitude,
+        }
+        for e in events
+    ]
+
+
+def _jd_to_datetime(jd: float) -> datetime:
+    """Convert a Julian Date (TLE epoch) to UTC datetime."""
+    return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=jd - 2440587.5)
 
 
 @st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
@@ -330,10 +361,10 @@ sat_query = st.sidebar.text_input(
 # Tabs — globe / observer / track
 # ---------------------------------------------------------------------------
 
-tab_globe, tab_decay, tab_bluemarble, tab_observer, tab_track = st.tabs([
+tab_globe, tab_decay, tab_maneuver, tab_observer, tab_track = st.tabs([
     "Constellation",
     "Decay Watch",
-    "Blue Marble (deck.gl)",
+    "Maneuvers",
     "Observer · Sky plot",
     "Ground track",
 ])
@@ -441,23 +472,153 @@ with tab_decay:
             },
         )
 
-with tab_bluemarble:
-    st.subheader("GPU globe — NASA Blue Marble")
+with tab_maneuver:
+    st.subheader("Maneuver detection")
     st.caption(
-        "deck.gl GlobeView with a photorealistic Earth backdrop. "
-        "GPU-rendered — smooth rotation even at full constellation scale. "
-        "Markers color-coded by decay risk; hover for details."
+        "Orbit raises and drops inferred from mean-motion jumps between "
+        "consecutive TLE epochs. **Boost** = orbit raised; **Drop** = orbit "
+        "lowered (often a deorbit phase). Magnitude tiers by |Δa|: "
+        "**small** (0.5–5 km) · **medium** (5–15 km) · **large** (>15 km). "
+        "Threshold rules exclude drag (max ~0.1 km/day at Starlink altitudes)."
     )
-    with st.spinner(f"Propagating {globe_limit:,} satellites..."):
-        positions_bm = cached_globe_positions(globe_limit, minute_bucket)
-        risk_map_bm = cached_risk_map(minute_bucket)
-    deck = render_globe_deck(positions_bm, risk_map=risk_map_bm)
-    st.pydeck_chart(deck, height=720)
-    st.caption(
-        "Earth texture is loaded from NASA's `eoimages.gsfc.nasa.gov`. "
-        "If you see a dark globe with only dots, the image is still loading "
-        "or the CDN is blocked from your network."
+
+    m1, m2 = st.columns([1.2, 1.0])
+    mnv_min_mag = m1.radio(
+        "Minimum magnitude", ["small", "medium", "large"],
+        index=1, horizontal=True,
+        help="'small' is the rawest view; 'large' shows only deorbits and major boosts.",
     )
+    since_days = m2.slider(
+        "Look back (days)", 1, 30, 14,
+        help="Filter to events whose latest epoch falls within this many days.",
+    )
+
+    with st.spinner("Running maneuver scan..."):
+        all_events = cached_maneuver_events(mnv_min_mag, minute_bucket)
+
+    cutoff_dt = now - timedelta(days=since_days)
+    events = [
+        e for e in all_events
+        if _jd_to_datetime(e["epoch_after"]) >= cutoff_dt
+    ]
+
+    if not events:
+        st.info(
+            f"No maneuvers detected at magnitude ≥ **{mnv_min_mag}** in the last "
+            f"{since_days} days. Loosen the magnitude or extend the window."
+        )
+    else:
+        counts_mag = {"small": 0, "medium": 0, "large": 0}
+        counts_dir = {"boost": 0, "drop": 0}
+        for e in events:
+            counts_mag[e["magnitude"]] = counts_mag.get(e["magnitude"], 0) + 1
+            counts_dir[e["direction"]] = counts_dir.get(e["direction"], 0) + 1
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Events", f"{len(events):,}")
+        c2.metric("Large", counts_mag["large"])
+        c3.metric("Medium", counts_mag["medium"])
+        c4.metric("Boosts", counts_dir["boost"])
+        c5.metric("Drops", counts_dir["drop"])
+
+        # Scatter: when each maneuver happened vs how big it was.
+        import plotly.graph_objects as go
+
+        boosts = [e for e in events if e["direction"] == "boost"]
+        drops = [e for e in events if e["direction"] == "drop"]
+
+        def _trace(rows: list[dict], color: str, name: str) -> go.Scatter:
+            return go.Scatter(
+                x=[_jd_to_datetime(r["epoch_after"]) for r in rows],
+                y=[r["delta_a_km"] for r in rows],
+                mode="markers",
+                name=f"{name} ({len(rows):,})",
+                marker=dict(
+                    size=[min(28, 6 + abs(r["delta_a_km"])) for r in rows],
+                    color=color,
+                    opacity=0.75,
+                    line=dict(width=0),
+                ),
+                text=[
+                    (
+                        f"<b>{r['name']}</b> (NORAD {r['norad_id']})<br>"
+                        f"{r['magnitude']} {r['direction']}<br>"
+                        f"Δa = {r['delta_a_km']:+.2f} km over {r['gap_days']:.2f} d<br>"
+                        f"alt {r['altitude_before_km']:.1f} → {r['altitude_after_km']:.1f} km"
+                    )
+                    for r in rows
+                ],
+                hoverinfo="text",
+            )
+
+        fig_m = go.Figure()
+        if drops:
+            fig_m.add_trace(_trace(drops, "#ff5a5f", "drop"))
+            fig_m.add_trace(_trace(boosts, "#5af0a0", "boost"))
+        elif boosts:
+            fig_m.add_trace(_trace(boosts, "#5af0a0", "boost"))
+        fig_m.add_hline(y=0, line_color="#3a4a60", line_width=1)
+        fig_m.update_layout(
+            paper_bgcolor="#06090f",
+            plot_bgcolor="#06090f",
+            font=dict(color="#dde6f1"),
+            xaxis=dict(
+                title="Epoch (UTC)", gridcolor="#1c2735",
+                zerolinecolor="#2a3a4f",
+            ),
+            yaxis=dict(
+                title="Δa (km)  ·  positive = boost",
+                gridcolor="#1c2735",
+                zerolinecolor="#2a3a4f",
+            ),
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(
+                bgcolor="rgba(6,9,15,0.7)",
+                bordercolor="#2a3a4f", borderwidth=1,
+            ),
+            height=440,
+        )
+        st.plotly_chart(fig_m, width="stretch")
+
+        st.markdown("**Detected events (most recent first):**")
+        table_rows = [
+            {
+                "when": _jd_to_datetime(e["epoch_after"]).strftime("%Y-%m-%d %H:%M"),
+                "magnitude": e["magnitude"],
+                "direction": e["direction"],
+                "norad_id": e["norad_id"],
+                "name": e["name"],
+                "delta_a_km": round(e["delta_a_km"], 2),
+                "delta_a_km_per_day": round(e["delta_a_km_per_day"], 3),
+                "gap_days": round(e["gap_days"], 2),
+                "altitude_before_km": round(e["altitude_before_km"], 1),
+                "altitude_after_km": round(e["altitude_after_km"], 1),
+            }
+            for e in events
+        ]
+        st.dataframe(
+            table_rows,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "when": st.column_config.TextColumn("When (UTC)"),
+                "magnitude": st.column_config.TextColumn("Mag"),
+                "direction": st.column_config.TextColumn("Dir"),
+                "norad_id": st.column_config.NumberColumn("NORAD", format="%d"),
+                "name": st.column_config.TextColumn("Name"),
+                "delta_a_km": st.column_config.NumberColumn("Δa (km)", format="%+.2f"),
+                "delta_a_km_per_day": st.column_config.NumberColumn(
+                    "rate (km/day)", format="%+.3f",
+                ),
+                "gap_days": st.column_config.NumberColumn("Gap (d)", format="%.2f"),
+                "altitude_before_km": st.column_config.NumberColumn(
+                    "Alt before (km)", format="%.1f",
+                ),
+                "altitude_after_km": st.column_config.NumberColumn(
+                    "Alt after (km)", format="%.1f",
+                ),
+            },
+        )
 
 with tab_observer:
     resolved = find_named_sat(sat_query)
