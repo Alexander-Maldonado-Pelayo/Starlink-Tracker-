@@ -6,7 +6,7 @@ Decisions we haven't made yet. Revisit before / during Phase 1 implementation.
 
 - **Git from day one?** → Not yet. Hold off until there's code worth committing.
 - **Python version?** → 3.11+.
-- **Snapshot frequency?** → Every 6 hours.
+- **Snapshot frequency?** → Every 1 hour.
 - **Tests from the start?** → Yes, pytest with synthetic TLE fixtures.
 
 ## Environment / tooling
@@ -14,7 +14,7 @@ Decisions we haven't made yet. Revisit before / during Phase 1 implementation.
 - **Windows-only or also WSL/Linux?** Affects whether we worry about path
   separators, line endings, and which scheduler we use for the snapshot writer
   (Task Scheduler vs. cron).
-- **Git from day one?** Recommended — the commit history itself becomes part
+- **Git from day one?** Recommended the commit history itself becomes part
   of the portfolio story.
 - **GitHub repo public or private until Phase 3 is done?** Public + a
   "WIP / portfolio project" README banner is a reasonable default.
@@ -23,10 +23,10 @@ Decisions we haven't made yet. Revisit before / during Phase 1 implementation.
 ## Scope refinements
 
 - **Snapshot frequency for TLE history?** CelesTrak updates several times daily.
-  Pulling every 6 hours is plenty for maneuver detection and keeps the DB small.
+  Pulling every 1 hour is plenty for maneuver detection and keeps the DB small.
 - **How far back to keep TLE history?** 90 days covers plenty of anomaly windows
   without bloating SQLite. Older data can be archived to CSV.
-- **Include non-Starlink "neighbors" for conjunction detection?** Yes — pull the
+- **Include non-Starlink "neighbors" for conjunction detection?** Yes pull the
   full active LEO catalog for conjunction context, but only run maneuver/inspector
   detection on Starlink itself. Keeps cost manageable.
 - **Geographic scope for pass prediction?** Default to "anywhere the user
@@ -38,7 +38,7 @@ Decisions we haven't made yet. Revisit before / during Phase 1 implementation.
   Python SGP4 batch propagation first; only drop into C if it's actually slow.
 - **Test coverage strategy?** Synthetic TLEs (known orbits, known answers) are
   more reliable than network-dependent tests. Write a fixture generator.
-- **Logging vs. print?** Use `logging` module from day one — Phase 4 dashboard
+- **Logging vs. print?** Use `logging` module from day one Phase 4 dashboard
   will want structured logs.
 
 ## Portfolio presentation
