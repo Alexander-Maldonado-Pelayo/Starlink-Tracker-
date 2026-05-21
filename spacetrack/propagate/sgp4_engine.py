@@ -8,12 +8,24 @@ Given a TLE and a UTC datetime, compute the satellite's geographic position
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 from skyfield.api import EarthSatellite, load, wgs84
+
+
+class PropagationError(RuntimeError):
+    """SGP4/Skyfield could not produce a valid position for this satellite.
+
+    Most commonly raised when a satellite is in active re-entry: its perigee
+    has dropped low enough that the SGP4 model's atmospheric assumptions
+    break down and the propagated position degrades to NaN. Callers that
+    iterate over many TLEs (``propagate_many``) catch and skip; callers
+    that follow one satellite (``live_sample``, ``where``) surface it.
+    """
 
 
 @dataclass(frozen=True)
@@ -53,12 +65,22 @@ def propagate(
     vx, vy, vz = geocentric.velocity.km_per_s
     speed = (vx * vx + vy * vy + vz * vz) ** 0.5
 
+    lat = subpoint.latitude.degrees
+    lon = subpoint.longitude.degrees
+    # Skyfield silently emits NaN when SGP4 hits its validity edge (very
+    # low-perigee deorbit phase). Surface that as a real error instead.
+    if not all(math.isfinite(v) for v in (lat, lon, altitude_km, speed)):
+        raise PropagationError(
+            f"SGP4 produced NaN/inf for {name} — the satellite has likely "
+            "decayed below the model's validity range."
+        )
+
     return SatPosition(
         norad_id=sat.model.satnum,
         name=name,
         when=when,
-        latitude=subpoint.latitude.degrees,
-        longitude=subpoint.longitude.degrees,
+        latitude=lat,
+        longitude=lon,
         altitude_km=altitude_km,
         speed_km_s=speed,
     )

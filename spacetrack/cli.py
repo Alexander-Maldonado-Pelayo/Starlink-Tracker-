@@ -21,6 +21,7 @@ from spacetrack.observer.visibility import (
     look_angles,
 )
 from spacetrack.propagate.sgp4_engine import (
+    PropagationError,
     propagate,
     propagate_many,
     propagate_track,
@@ -499,7 +500,15 @@ def live(
 
     try:
         while True:
-            sample = live_sample(tle.name, tle.line1, tle.line2, site)
+            try:
+                sample = live_sample(tle.name, tle.line1, tle.line2, site)
+            except PropagationError as exc:
+                click.echo(f"\n{tle.name} can no longer be tracked: {exc}", err=True)
+                click.echo(
+                    "This usually means the satellite is in active re-entry "
+                    "and SGP4 won't model it reliably. Try a higher-altitude sat."
+                )
+                return
             p, look = sample.position, sample.look
             lat_dir = "N" if p.latitude >= 0 else "S"
             lon_dir = "E" if p.longitude >= 0 else "W"
