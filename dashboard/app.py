@@ -8,6 +8,8 @@ or via the CLI:
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +40,11 @@ from spacetrack.tle.fetcher import (
     load_bundled_seed,
     now_unix,
 )
+from spacetrack.tle.spacetrack_fetcher import (
+    SpaceTrackAuthError,
+    SpaceTrackError,
+    fetch_starlink_for_range,
+)
 from spacetrack.anomaly import decay as decay_mod
 from spacetrack.anomaly import maneuver as maneuver_mod
 from spacetrack.viz.globe3d import render_globe
@@ -60,6 +67,19 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+log = logging.getLogger(__name__)
+
+# Forward Streamlit Cloud secrets into env vars so the Space-Track fetcher
+# (which reads from os.environ) works in both local and Cloud deploys.
+# Has no effect if no secrets are configured.
+try:
+    for _key in ("SPACETRACK_IDENTITY", "SPACETRACK_PASSWORD"):
+        _val = st.secrets.get(_key) if hasattr(st, "secrets") else None
+        if _val and not os.environ.get(_key):
+            os.environ[_key] = _val
+except Exception:  # noqa: BLE001 — secrets backend not configured locally is fine
+    pass
 
 # ---------------------------------------------------------------------------
 # Data loaders (cached so propagation isn't re-run every Streamlit interaction)
@@ -97,12 +117,21 @@ def db_stats() -> dict[str, int | str | None]:
     return {"sats": sats, "snapshots": snaps, "last_update": last}
 
 
-def bootstrap_catalog_if_empty() -> None:
-    """Fetch a fresh TLE snapshot if the DB has no Starlink data.
+SPACETRACK_BOOTSTRAP_DAYS = 7
 
-    Streamlit Cloud (or anyone running a fresh checkout) won't have a local
-    `data/spacetrack.db` populated. Without this, the dashboard would render
-    an error and stop. Instead, fetch once on first run and persist.
+
+def bootstrap_catalog_if_empty() -> None:
+    """Populate the DB on first run, trying the best source available.
+
+    Source order:
+    1. **CelesTrak** — single current snapshot. Fast, no auth. Blocked from
+       Streamlit Cloud egress, works fine locally.
+    2. **Space-Track gp_history** — last ``SPACETRACK_BOOTSTRAP_DAYS`` days
+       of TLEs. Multi-epoch history is what powers maneuver detection, so
+       this is preferred on Cloud. Requires SPACETRACK_IDENTITY +
+       SPACETRACK_PASSWORD (env vars or Streamlit Cloud Secrets).
+    3. **Bundled seed** — one snapshot committed to the repo. Last-resort
+       fallback so the dashboard still renders if both networks are down.
     """
     db.init_db(DB_PATH)
     with db.session(DB_PATH) as conn:
@@ -112,28 +141,59 @@ def bootstrap_catalog_if_empty() -> None:
     if count > 0:
         return
 
+    tles = None
+    source: str | None = None
+    celestrak_err: Exception | None = None
+
+    # 1. CelesTrak (cheap, current only).
     with st.spinner("First run: fetching the current Starlink catalog from CelesTrak..."):
         try:
             tles = fetch_starlink()
+            source = "celestrak (current snapshot)"
         except FetchError as exc:
-            # Some hosts (e.g. Streamlit Cloud egress) can't reach CelesTrak.
-            # Fall back to the bundled seed snapshot so the demo still works.
-            try:
-                tles = load_bundled_seed()
-                st.warning(
-                    "CelesTrak is unreachable from this host — showing a bundled "
-                    "snapshot instead. Positions are propagated from the most recent "
-                    "TLEs committed to the repo.",
-                )
-            except Exception as seed_exc:
-                st.error(
-                    f"Couldn't fetch live data and the bundled seed failed to load.\n\n"
-                    f"`{exc}`\n\n`{seed_exc}`"
-                )
-                st.stop()
-        with db.session(DB_PATH) as conn:
-            write_snapshots(conn, tles, fetched_at=now_unix(), constellation="starlink")
-    # Reset cached stats so the metrics strip reflects the new data.
+            celestrak_err = exc
+            log.info("CelesTrak unreachable, falling through: %s", exc)
+
+    # 2. Space-Track multi-day history (preferred for the maneuver detector).
+    if tles is None and os.environ.get("SPACETRACK_IDENTITY"):
+        try:
+            with st.spinner(
+                f"Backfilling {SPACETRACK_BOOTSTRAP_DAYS} days of Starlink history "
+                "from Space-Track..."
+            ):
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(days=SPACETRACK_BOOTSTRAP_DAYS)
+                tles = fetch_starlink_for_range(start, end)
+                source = f"space-track ({SPACETRACK_BOOTSTRAP_DAYS}-day history)"
+        except (SpaceTrackAuthError, SpaceTrackError) as exc:
+            log.warning("Space-Track bootstrap failed: %s", exc)
+            st.warning(f"Space-Track fetch failed: {exc}")
+
+    # 3. Bundled seed (last resort).
+    if tles is None:
+        try:
+            tles = load_bundled_seed()
+            source = "bundled seed"
+            st.warning(
+                "Live data sources unreachable — showing the bundled seed snapshot. "
+                "Positions are propagated from the most recent TLEs committed to "
+                "the repo. The Maneuvers tab needs multi-epoch history and will "
+                "be empty in this mode."
+            )
+        except Exception as seed_exc:  # noqa: BLE001
+            st.error(
+                "Couldn't fetch live data and the bundled seed failed to load.\n\n"
+                f"CelesTrak: `{celestrak_err}`\n\n"
+                f"Seed: `{seed_exc}`"
+            )
+            st.stop()
+
+    with db.session(DB_PATH) as conn:
+        new_count, total = write_snapshots(
+            conn, tles, fetched_at=now_unix(), constellation="starlink"
+        )
+    log.info("Bootstrap source=%s persisted=%d/%d", source, new_count, total)
+
     db_stats.clear()
     load_all_tles.clear()
 
