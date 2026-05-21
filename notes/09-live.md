@@ -61,7 +61,7 @@ PowerShell script's `-Argument` to wrap the call in a redirect, e.g.
 
 - The task only runs when you're logged on (default). To run when logged off,
   register it via Task Scheduler GUI and check **Run whether user is logged
-  on or not** — that requires saving your password.
+  on or not** that requires saving your password.
 - If your laptop is asleep when a fire time comes around, the task is skipped
   for that interval but fires at the next one.
 
