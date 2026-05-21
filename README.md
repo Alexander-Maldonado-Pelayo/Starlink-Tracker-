@@ -34,8 +34,8 @@ spacetrack dashboard                    # launch Streamlit web dashboard at loca
 ## The pitch
 
 Most "satellite tracker" projects stop at "show pretty 3D globe." This one borrows
-the playbook of Space Domain Awareness (SDA) — the discipline used by orgs like
-LeoLabs, Slingshot, and US Space Force — and asks the harder question:
+the playbook of Space Domain Awareness (SDA) the discipline used by orgs like
+LeoLabs, Slingshot, and US Space Force and asks the harder question:
 
 > Out of 6,500 Starlink satellites, which ones are doing something they shouldn't be?
 
