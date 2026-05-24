@@ -34,6 +34,7 @@ from spacetrack.storage.queries import find_satellite, get_latest_tle
 from spacetrack.storage.snapshot import write_snapshots
 from spacetrack.tle.fetcher import (
     FetchError,
+    NoNewData,
     fetch_starlink,
     load_bundled_seed,
     now_unix,
@@ -54,6 +55,12 @@ PAGE_REFRESH_SECONDS = 3600  # 1 hour
 # How long cached data (TLE rows, DB stats) is reused across reruns. Kept
 # short so pressing R for a manual rerun gives you fresh propagation.
 DATA_CACHE_SECONDS = 60
+
+# CelesTrak refreshes the Starlink GP feed roughly every 2 hours. Re-pull
+# the catalog when the freshest snapshot in the DB is older than this so
+# the dashboard reflects live TLEs without needing a manual `spacetrack
+# update`. A small buffer past 2h avoids hammering CelesTrak with 403s.
+CATALOG_MAX_AGE_SECONDS = 2 * 3600 + 600  # 2h 10m
 
 st.set_page_config(
     page_title="Starlink Watch",
@@ -97,27 +104,57 @@ def db_stats() -> dict[str, int | str | None]:
     return {"sats": sats, "snapshots": snaps, "last_update": last}
 
 
-def bootstrap_catalog_if_empty() -> None:
-    """Fetch a fresh TLE snapshot if the DB has no Starlink data.
+def ensure_fresh_catalog() -> None:
+    """Bootstrap the catalog on first run and refresh stale TLEs from CelesTrak.
 
-    Streamlit Cloud (or anyone running a fresh checkout) won't have a local
-    `data/spacetrack.db` populated. Without this, the dashboard would render
-    an error and stop. Instead, fetch once on first run and persist.
+    Two cases:
+      * DB empty (fresh checkout or first deploy) — fetch once and persist,
+        falling back to the bundled seed if CelesTrak is unreachable.
+      * Most recent snapshot is older than CATALOG_MAX_AGE_SECONDS — pull
+        a new snapshot so propagated positions track the live constellation.
+        Failures here are soft: keep serving the stale catalog rather than
+        breaking the dashboard.
     """
     db.init_db(DB_PATH)
     with db.session(DB_PATH) as conn:
         count = conn.execute(
             "SELECT COUNT(*) FROM satellites WHERE constellation = 'starlink'"
         ).fetchone()[0]
-    if count > 0:
+        last_fetched = conn.execute(
+            "SELECT MAX(fetched_at) FROM tle_snapshots"
+        ).fetchone()[0]
+
+    is_empty = count == 0
+    is_stale = (
+        last_fetched is not None
+        and (now_unix() - int(last_fetched)) > CATALOG_MAX_AGE_SECONDS
+    )
+
+    if not is_empty and not is_stale:
         return
 
-    with st.spinner("First run: fetching the current Starlink catalog from CelesTrak..."):
+    spinner_msg = (
+        "First run: fetching the current Starlink catalog from CelesTrak..."
+        if is_empty
+        else "Catalog is stale — refreshing live TLEs from CelesTrak..."
+    )
+
+    with st.spinner(spinner_msg):
         try:
             tles = fetch_starlink()
+        except NoNewData:
+            # CelesTrak hasn't published a new catalog yet; current DB is
+            # already up to date relative to upstream, so nothing to do.
+            return
         except FetchError as exc:
-            # Some hosts (e.g. Streamlit Cloud egress) can't reach CelesTrak.
-            # Fall back to the bundled seed snapshot so the demo still works.
+            if not is_empty:
+                # Stale refresh failed — keep serving what we have.
+                st.warning(
+                    f"Couldn't refresh from CelesTrak ({exc}). Showing the "
+                    f"last cached snapshot."
+                )
+                return
+            # First run with no data: fall back to the bundled seed snapshot.
             try:
                 tles = load_bundled_seed()
                 st.warning(
@@ -232,8 +269,9 @@ st.caption(
     "predictions.  ·  Data: CelesTrak  ·  Propagation: SGP4 via Skyfield"
 )
 
-# Bootstrap the catalog if the DB is empty (e.g. first run on a fresh deploy).
-bootstrap_catalog_if_empty()
+# Bootstrap on first run, and auto-refresh from CelesTrak when the catalog
+# has gone stale (older than CelesTrak's ~2h update cadence).
+ensure_fresh_catalog()
 
 # Top-level stats strip
 stats = db_stats()
@@ -523,7 +561,8 @@ with tab_track:
 st.caption(
     f"Page auto-refreshes every {refresh_label}. "
     f"Press **R** for a manual rerun (gets fresh positions in seconds). "
-    f"Catalog refreshes only when `spacetrack update` runs."
+    f"Catalog auto-refreshes from CelesTrak when it goes stale "
+    f"(>{CATALOG_MAX_AGE_SECONDS // 3600}h old)."
 )
 
 # Streamlit's autorefresh helper requires an extra package; the simpler
