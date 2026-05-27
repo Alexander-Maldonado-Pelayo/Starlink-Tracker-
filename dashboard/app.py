@@ -73,10 +73,14 @@ st.set_page_config(
 log = logging.getLogger(__name__)
 
 # Forward Streamlit Cloud secrets into env vars so the Space-Track fetcher
-# (which reads from os.environ) works in both local and Cloud deploys.
-# Has no effect if no secrets are configured.
+# and the Turso DB connector (both of which read from os.environ) work in
+# Cloud the same way they do locally. Has no effect when no secrets are
+# configured — local dev keeps using its file-based SQLite DB.
 try:
-    for _key in ("SPACETRACK_IDENTITY", "SPACETRACK_PASSWORD"):
+    for _key in (
+        "SPACETRACK_IDENTITY", "SPACETRACK_PASSWORD",
+        "TURSO_URL", "TURSO_AUTH_TOKEN",
+    ):
         _val = st.secrets.get(_key) if hasattr(st, "secrets") else None
         if _val and not os.environ.get(_key):
             os.environ[_key] = _val
@@ -125,13 +129,16 @@ SPACETRACK_BOOTSTRAP_DAYS = 7
 def bootstrap_catalog_if_empty() -> None:
     """Populate the DB on first run, trying the best source available.
 
-    Source order:
-    1. **CelesTrak** — single current snapshot. Fast, no auth. Blocked from
-       Streamlit Cloud egress, works fine locally.
+    When Turso is configured (production), this short-circuits: the
+    scheduled GitHub Action owns catalog refresh, the dashboard just reads.
+    An empty Turso DB means the action hasn't run yet — we surface that as
+    a clear message instead of trying to backfill live, which is the user-
+    facing failure mode this entire deploy was designed to eliminate.
+
+    For local SQLite, the original fallback chain still applies:
+    1. **CelesTrak** — single current snapshot. Fast, no auth.
     2. **Space-Track gp_history** — last ``SPACETRACK_BOOTSTRAP_DAYS`` days
-       of TLEs. Multi-epoch history is what powers maneuver detection, so
-       this is preferred on Cloud. Requires SPACETRACK_IDENTITY +
-       SPACETRACK_PASSWORD (env vars or Streamlit Cloud Secrets).
+       of TLEs. Requires SPACETRACK_IDENTITY + SPACETRACK_PASSWORD.
     3. **Bundled seed** — one snapshot committed to the repo. Last-resort
        fallback so the dashboard still renders if both networks are down.
     """
@@ -142,6 +149,15 @@ def bootstrap_catalog_if_empty() -> None:
         ).fetchone()[0]
     if count > 0:
         return
+
+    if os.environ.get("TURSO_URL"):
+        st.error(
+            "Turso database is empty. The scheduled `refresh-tles` GitHub "
+            "Action populates the catalog every two hours — wait for the "
+            "next run, or trigger it manually via Actions ▸ Refresh TLE "
+            "catalog ▸ Run workflow."
+        )
+        st.stop()
 
     tles = None
     source: str | None = None

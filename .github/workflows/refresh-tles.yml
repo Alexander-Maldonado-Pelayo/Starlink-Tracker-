@@ -1,0 +1,62 @@
+name: Refresh TLE catalog
+
+# Pulls the latest Starlink TLEs from CelesTrak and the non-Starlink "active"
+# catalog every two hours, writing into Turso. The dashboard reads from Turso
+# on every page load, so the deploy never depends on live Space-Track or
+# CelesTrak responses at user-request time.
+#
+# Required repo secrets:
+#   TURSO_URL              libsql:// URL of the production database
+#   TURSO_AUTH_TOKEN       service-token auth for Turso
+#   SPACETRACK_IDENTITY    Space-Track.org login (fallback if CelesTrak is down)
+#   SPACETRACK_PASSWORD    Space-Track.org password
+
+on:
+  # Every 2 hours on the hour — matches CelesTrak's publish cadence.
+  schedule:
+    - cron: "0 */2 * * *"
+  # Manual trigger for backfills or post-outage catch-up.
+  workflow_dispatch:
+
+# Cancel an in-flight run if a new one starts, to avoid stepping on ourselves.
+concurrency:
+  group: refresh-tles
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TURSO_URL: ${{ secrets.TURSO_URL }}
+      TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+      SPACETRACK_IDENTITY: ${{ secrets.SPACETRACK_IDENTITY }}
+      SPACETRACK_PASSWORD: ${{ secrets.SPACETRACK_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install spacetrack + Turso client
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[turso]"
+
+      - name: Refresh Starlink TLEs (CelesTrak)
+        # The 'update' command 403s gracefully when CelesTrak says no new
+        # data. We don't fail the whole job for that — the rest of the
+        # refresh (catalog update) is still worth running.
+        continue-on-error: true
+        run: spacetrack update
+
+      - name: Refresh non-Starlink catalog (CelesTrak `active` group)
+        continue-on-error: true
+        run: spacetrack update-catalog
+
+      - name: Report final DB stats
+        run: spacetrack stats

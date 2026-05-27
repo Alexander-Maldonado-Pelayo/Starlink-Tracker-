@@ -3,14 +3,27 @@
 The full schema is defined here from day one because the Phase 3 anomaly
 detectors (maneuver, conjunction, inspector, decay) all read from the
 tle_snapshots history. Designing the schema upfront avoids painful migrations.
+
+Dual-mode connection:
+
+* **Local SQLite** (default) — stdlib ``sqlite3`` against a file path. Used
+  for local development, tests, and the CLI when no Turso credentials are
+  present. Zero external dependencies.
+* **Turso** (production) — remote libsql when ``TURSO_URL`` and
+  ``TURSO_AUTH_TOKEN`` are set. Streamlit Cloud reads from this; a scheduled
+  GitHub Action writes fresh TLEs into it every two hours. The connection
+  returns a thin wrapper that exposes the same ``execute``/``fetchall``
+  surface as ``sqlite3.Connection``, including dict-style row access by
+  column name, so callers don't branch on backend.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 DEFAULT_DB_PATH = Path("data/spacetrack.db")
 
@@ -66,7 +79,156 @@ CREATE INDEX IF NOT EXISTS idx_anomalies_type
 """
 
 
-def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
+def _use_turso() -> bool:
+    return bool(os.environ.get("TURSO_URL") and os.environ.get("TURSO_AUTH_TOKEN"))
+
+
+# ---------------------------------------------------------------------------
+# Turso adapter: thin wrapper around libsql.Connection that adds
+# sqlite3.Row-compatible row access by column name. libsql's native rows are
+# plain tuples; this wrapper turns them into objects supporting both
+# ``row[0]`` and ``row['column']``.
+# ---------------------------------------------------------------------------
+
+
+class _Row:
+    """Dict-like row matching sqlite3.Row's surface."""
+
+    __slots__ = ("_values", "_keys")
+
+    def __init__(self, values: tuple, keys: tuple[str, ...]) -> None:
+        self._values = values
+        self._keys = keys
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        try:
+            idx = self._keys.index(key)
+        except ValueError as exc:
+            raise KeyError(key) from exc
+        return self._values[idx]
+
+    def keys(self) -> tuple[str, ...]:
+        return self._keys
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __repr__(self) -> str:
+        pairs = ", ".join(f"{k}={v!r}" for k, v in zip(self._keys, self._values))
+        return f"_Row({pairs})"
+
+
+class _Cursor:
+    """Cursor wrapper that promotes tuple rows to _Row."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    @property
+    def description(self):
+        return self._real.description
+
+    @property
+    def rowcount(self) -> int:
+        return self._real.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._real.lastrowid
+
+    def _keys(self) -> tuple[str, ...]:
+        desc = self._real.description
+        return tuple(d[0] for d in desc) if desc else ()
+
+    def fetchone(self):
+        row = self._real.fetchone()
+        if row is None:
+            return None
+        return _Row(tuple(row), self._keys())
+
+    def fetchall(self):
+        rows = self._real.fetchall()
+        keys = self._keys()
+        return [_Row(tuple(r), keys) for r in rows]
+
+    def fetchmany(self, size: int | None = None):
+        rows = self._real.fetchmany(size) if size else self._real.fetchmany()
+        keys = self._keys()
+        return [_Row(tuple(r), keys) for r in rows]
+
+    def execute(self, *args, **kwargs):
+        self._real = self._real.execute(*args, **kwargs)
+        return self
+
+    def executemany(self, *args, **kwargs):
+        self._real.executemany(*args, **kwargs)
+        return self
+
+    def close(self) -> None:
+        self._real.close()
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _Connection:
+    """libsql.Connection wrapper that produces _Row results."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    def execute(self, *args, **kwargs) -> _Cursor:
+        return _Cursor(self._real.execute(*args, **kwargs))
+
+    def executemany(self, *args, **kwargs):
+        self._real.executemany(*args, **kwargs)
+
+    def executescript(self, script: str):
+        self._real.executescript(script)
+
+    def cursor(self) -> _Cursor:
+        return _Cursor(self._real.cursor())
+
+    def commit(self) -> None:
+        self._real.commit()
+
+    def rollback(self) -> None:
+        self._real.rollback()
+
+    def close(self) -> None:
+        self._real.close()
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+
+def _connect_turso():
+    """Open a libsql connection to Turso. Imported lazily — local dev and
+    tests never need libsql installed."""
+    import libsql  # type: ignore[import-not-found]
+
+    url = os.environ["TURSO_URL"]
+    token = os.environ["TURSO_AUTH_TOKEN"]
+    raw = libsql.connect(database=url, auth_token=token)
+    return _Connection(raw)
+
+
+def connect(db_path: Path = DEFAULT_DB_PATH) -> Any:
+    """Open a database connection. Uses Turso when configured, else SQLite.
+
+    The returned object exposes the same surface either way — callers can
+    treat it as a ``sqlite3.Connection`` (``execute`` returns a cursor whose
+    rows support both index and column-name access).
+    """
+    if _use_turso():
+        return _connect_turso()
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -76,12 +238,16 @@ def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 
 def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
-    with connect(db_path) as conn:
+    conn = connect(db_path)
+    try:
         conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @contextmanager
-def session(db_path: Path = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
+def session(db_path: Path = DEFAULT_DB_PATH) -> Iterator[Any]:
     conn = connect(db_path)
     try:
         yield conn

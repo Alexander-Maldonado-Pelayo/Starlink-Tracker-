@@ -8,6 +8,9 @@ plotly>=5.20
 streamlit>=1.32
 mapbox-earcut>=1.0
 pydeck>=0.9
+# Turso (libsql) for the production DB — engaged only when TURSO_URL and
+# TURSO_AUTH_TOKEN are set in Streamlit Cloud Secrets.
+libsql>=0.1.11
 # Install the local spacetrack package itself so `from spacetrack...`
 # imports resolve on Streamlit Cloud (which only reads requirements.txt).
 -e .

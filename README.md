@@ -60,6 +60,38 @@ deviations become tractable to detect with public data alone.
 - Spoofing / jamming detection (different project, would need RF data).
 - Tracking the full ~10k object public catalog (Starlink-only keeps scope tight).
 
+## Production deploy (Turso + scheduled refresh)
+
+The Streamlit Cloud deploy reads from [Turso](https://turso.tech) (cloud
+SQLite), and a GitHub Action repopulates that database every two hours from
+CelesTrak. Users never wait on a live Space-Track fetch — the dashboard's
+DB is always already current. To set this up on a fork:
+
+1. **Create a Turso DB** — `turso db create starlink-watch`, then capture
+   the URL (`turso db show starlink-watch`) and an auth token
+   (`turso db tokens create starlink-watch`).
+2. **Add four GitHub repo secrets** (Settings ▸ Secrets and variables ▸
+   Actions):
+   - `TURSO_URL` — `libsql://your-db.turso.io`
+   - `TURSO_AUTH_TOKEN` — the token from step 1
+   - `SPACETRACK_IDENTITY` — Space-Track.org login (used by the action as a
+     fallback if CelesTrak fails)
+   - `SPACETRACK_PASSWORD`
+3. **Add the same four to Streamlit Cloud Secrets** so the dashboard reads
+   from Turso instead of a local file.
+4. **Migrate existing local data** (one-shot, optional):
+   ```powershell
+   $env:TURSO_URL = "libsql://..."
+   $env:TURSO_AUTH_TOKEN = "eyJh..."
+   python scripts/migrate_to_turso.py
+   ```
+5. **Trigger the first refresh** — Actions ▸ Refresh TLE catalog ▸ Run
+   workflow. Subsequent runs fire automatically every two hours.
+
+Local development keeps using a file-based SQLite DB at `data/spacetrack.db`
+— the Turso path activates only when both `TURSO_URL` and
+`TURSO_AUTH_TOKEN` are set in the environment.
+
 ## Project layout (planned)
 
 See [notes/01-architecture.md](notes/01-architecture.md) for the full breakdown.

@@ -25,6 +25,10 @@ dependencies = [
     "requests>=2.32",
 ]
 
+# Turso connectivity is only loaded when TURSO_URL/TURSO_AUTH_TOKEN are set,
+# but Streamlit Cloud and the GitHub Action both need the wheel installed.
+# Local dev and tests don't touch this code path.
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
@@ -40,6 +44,10 @@ dashboard = [
     "streamlit>=1.32",
     "mapbox-earcut>=1.0",
     "pydeck>=0.9",
+    "libsql>=0.1.11",
+]
+turso = [
+    "libsql>=0.1.11",
 ]
 
 [project.scripts]
