@@ -86,6 +86,18 @@ def fetch_starlink(*, timeout: float = 30.0) -> list[ParsedTLE]:
     return parsed
 
 
+def fetch_active(*, timeout: float = 30.0) -> list[ParsedTLE]:
+    """Fetch CelesTrak's `active` group: every operational satellite.
+
+    Includes Starlink — callers building a non-Starlink catalog should filter
+    by NORAD ID against the Starlink set.
+    """
+    raw = fetch_group("active", timeout=timeout)
+    parsed = parse_block(raw)
+    log.info("Parsed %d active-catalog TLEs", len(parsed))
+    return parsed
+
+
 def load_bundled_seed() -> list[ParsedTLE]:
     """Return the bundled Starlink TLE snapshot.
 

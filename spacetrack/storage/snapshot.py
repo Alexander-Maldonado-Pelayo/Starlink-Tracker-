@@ -73,3 +73,46 @@ def write_snapshots(
 
     log.info("Persisted %d new TLEs (out of %d fetched)", new_count, total)
     return new_count, total
+
+
+def write_external_catalog(
+    conn: sqlite3.Connection,
+    tles: Iterable[ParsedTLE],
+    *,
+    fetched_at: int,
+    constellation: str = "other",
+    skip_constellation: str = "starlink",
+) -> tuple[int, int, int]:
+    """Ingest a non-Starlink catalog for conjunction screening.
+
+    Skips any TLE whose ``norad_id`` is already tagged with
+    ``skip_constellation`` so the upsert doesn't clobber the Starlink label
+    on overlapping rows (CelesTrak's ``active`` group includes Starlink).
+
+    Returns ``(new_snapshots, total_seen, skipped)``.
+    """
+    starlink_ids = {
+        row["norad_id"]
+        for row in conn.execute(
+            "SELECT norad_id FROM satellites WHERE constellation = ?",
+            (skip_constellation,),
+        )
+    }
+
+    new_count = 0
+    total = 0
+    skipped = 0
+    for tle in tles:
+        total += 1
+        if tle.norad_id in starlink_ids:
+            skipped += 1
+            continue
+        upsert_satellite(conn, tle, constellation)
+        if insert_snapshot(conn, tle, fetched_at):
+            new_count += 1
+
+    log.info(
+        "External catalog: %d new TLEs out of %d (skipped %d already-tracked sats)",
+        new_count, total, skipped,
+    )
+    return new_count, total, skipped

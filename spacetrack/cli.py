@@ -11,7 +11,9 @@ from pathlib import Path
 import click
 
 from spacetrack import __version__
+from spacetrack.anomaly import conjunction as conjunction_mod
 from spacetrack.anomaly import decay as decay_mod
+from spacetrack.anomaly import inspector as inspector_mod
 from spacetrack.anomaly import maneuver as maneuver_mod
 from spacetrack.live import live_sample
 from spacetrack.observer.visibility import (
@@ -27,8 +29,8 @@ from spacetrack.propagate.sgp4_engine import (
 )
 from spacetrack.storage import db
 from spacetrack.storage.queries import find_satellite, get_latest_tle
-from spacetrack.storage.snapshot import write_snapshots
-from spacetrack.tle.fetcher import NoNewData, fetch_starlink, now_unix
+from spacetrack.storage.snapshot import write_external_catalog, write_snapshots
+from spacetrack.tle.fetcher import NoNewData, fetch_active, fetch_starlink, now_unix
 from spacetrack.tle.spacetrack_fetcher import (
     SpaceTrackAuthError,
     SpaceTrackError,
@@ -799,6 +801,273 @@ def maneuver(
             f"(rate {ev.delta_a_km_per_day:+.3f} km/d) "
             f"alt {ev.altitude_before_km:.1f} → {ev.altitude_after_km:.1f} km"
         )
+
+
+@main.command("update-catalog")
+@click.pass_context
+def update_catalog(ctx: click.Context) -> None:
+    """Fetch CelesTrak's `active` catalog (non-Starlink) for conjunction screening.
+
+    Stored under constellation='other'. Skips NORAD IDs already tagged
+    'starlink' so the upsert doesn't clobber the constellation label.
+    """
+    db_path: Path = ctx.obj["db_path"]
+    fetched_at = now_unix()
+
+    try:
+        tles = fetch_active()
+    except NoNewData as exc:
+        click.echo(str(exc))
+        return
+    except Exception as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    with db.session(db_path) as conn:
+        new_count, total, skipped = write_external_catalog(
+            conn, tles, fetched_at=fetched_at, constellation="other",
+        )
+
+    click.echo(
+        f"Catalog refresh: {total:,} active TLEs received, "
+        f"{new_count:,} new ({skipped:,} skipped as already-tracked Starlink)."
+    )
+
+
+@main.command()
+@click.argument("identifier", required=False)
+@click.option("--scan", is_flag=True,
+              help="Scan every tracked Starlink instead of one IDENTIFIER.")
+@click.option("--min-risk",
+              type=click.Choice(["low", "medium", "high", "critical"]),
+              default="low", show_default=True,
+              help="Minimum miss-distance tier to report.")
+@click.option("--hours-ahead", type=float,
+              default=conjunction_mod.DEFAULT_FORECAST_HOURS, show_default=True,
+              help="Forecast window in hours.")
+@click.option("--step-seconds", type=float,
+              default=conjunction_mod.DEFAULT_STEP_SECONDS, show_default=True,
+              help="Propagation step inside the window.")
+@click.option("--max-distance-km", type=float,
+              default=conjunction_mod.DEFAULT_MAX_DISTANCE_KM, show_default=True,
+              help="Drop conjunctions whose closest approach exceeds this.")
+@click.option("--cap", type=int,
+              default=conjunction_mod.DEFAULT_MAX_CANDIDATES_PER_PRIMARY, show_default=True,
+              help="Max candidate secondaries per primary after altitude pre-filter.")
+@click.option("--primary-limit", type=int, default=None,
+              help="With --scan, cap on primary satellites (for quick previews).")
+@click.option("--limit", type=int, default=None,
+              help="Cap on rows printed (default: unlimited).")
+@click.pass_context
+def conjunction(
+    ctx: click.Context,
+    identifier: str | None,
+    scan: bool,
+    min_risk: str,
+    hours_ahead: float,
+    step_seconds: float,
+    max_distance_km: float,
+    cap: int,
+    primary_limit: int | None,
+    limit: int | None,
+) -> None:
+    """Screen for close approaches between Starlink and the external catalog.
+
+    Requires the external catalog to be populated via `spacetrack update-catalog`.
+    Without --scan, IDENTIFIER must be a NORAD ID or satellite name and the
+    command finds every close approach for that one satellite. With --scan,
+    every tracked Starlink is screened against the 'other' constellation.
+    """
+    db_path: Path = ctx.obj["db_path"]
+
+    if scan:
+        with db.session(db_path) as conn:
+            other_count = conn.execute(
+                "SELECT COUNT(*) FROM satellites WHERE constellation = 'other'"
+            ).fetchone()[0]
+            if other_count == 0:
+                click.echo(
+                    "error: no external catalog loaded. "
+                    "Run `spacetrack update-catalog` first.",
+                    err=True,
+                )
+                sys.exit(1)
+            events = conjunction_mod.scan(
+                conn,
+                forecast_hours=hours_ahead,
+                step_seconds=step_seconds,
+                max_distance_km=max_distance_km,
+                cap=cap,
+                min_risk=min_risk,  # type: ignore[arg-type]
+                primary_limit=primary_limit,
+            )
+        if not events:
+            click.echo(
+                f"No conjunctions at risk >= {min_risk} within {hours_ahead:.0f}h."
+            )
+            return
+        shown = events[:limit] if limit else events
+        click.echo(
+            f"{len(events)} conjunction(s) at risk >= {min_risk}"
+            + (f" (showing first {len(shown)})" if limit and len(shown) < len(events) else "")
+            + ":"
+        )
+        click.echo(
+            f"  {'RISK':<9} {'PRIMARY':<22} {'SECONDARY':<22} "
+            f"{'MISS(km)':>9} {'REL_V(km/s)':>11} {'TCA(UTC)':<19}"
+        )
+        for ev in shown:
+            tca_iso = datetime.fromtimestamp(ev.tca_unix, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            click.echo(
+                f"  {ev.risk:<9} {ev.primary_name[:22]:<22} "
+                f"{ev.secondary_name[:22]:<22} "
+                f"{ev.miss_distance_km:>9.3f} "
+                f"{ev.relative_velocity_km_s:>11.3f} {tca_iso:<19}"
+            )
+        return
+
+    if not identifier:
+        click.echo("error: provide IDENTIFIER or use --scan", err=True)
+        sys.exit(1)
+
+    with db.session(db_path) as conn:
+        norad_id = find_satellite(conn, identifier)
+        if norad_id is None:
+            click.echo(f"error: no satellite matches {identifier!r}.", err=True)
+            sys.exit(1)
+        events = conjunction_mod.scan_satellite(
+            conn, norad_id,
+            forecast_hours=hours_ahead,
+            step_seconds=step_seconds,
+            max_distance_km=max_distance_km,
+            cap=cap,
+        )
+
+    if not events:
+        click.echo(
+            f"No conjunctions within {hours_ahead:.0f}h for NORAD {norad_id} "
+            f"(threshold {max_distance_km:.1f} km)."
+        )
+        return
+
+    click.echo(
+        f"{len(events)} conjunction(s) within {hours_ahead:.0f}h for "
+        f"NORAD {norad_id} ({events[0].primary_name}):"
+    )
+    for ev in events:
+        tca_iso = datetime.fromtimestamp(ev.tca_unix, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        click.echo(
+            f"  [{ev.risk}] vs {ev.secondary_name} (NORAD {ev.secondary_norad_id}) "
+            f"miss {ev.miss_distance_km:.3f} km @ {tca_iso} "
+            f"(rel v {ev.relative_velocity_km_s:.3f} km/s)"
+        )
+
+
+@main.command()
+@click.argument("identifier", required=False)
+@click.option("--scan", is_flag=True,
+              help="Scan every tracked Starlink instead of one IDENTIFIER.")
+@click.option("--min-severity",
+              type=click.Choice(["notable", "significant", "extreme"]),
+              default="notable", show_default=True,
+              help="Minimum severity tier to report under --scan.")
+@click.option("--window-days", type=float,
+              default=inspector_mod.DEFAULT_WINDOW_DAYS, show_default=True,
+              help="History window length (days) used to fit the baseline trend.")
+@click.option("--min-snapshots", type=int,
+              default=inspector_mod.DEFAULT_MIN_SNAPSHOTS, show_default=True,
+              help="Skip sats with fewer snapshots in the window.")
+@click.option("--threshold", "notable_threshold", type=float,
+              default=inspector_mod.DEFAULT_NOTABLE_THRESHOLD, show_default=True,
+              help="Z-score threshold for the 'notable' tier.")
+@click.option("--limit", type=int, default=None,
+              help="Cap on rows printed (default: unlimited).")
+@click.pass_context
+def inspector(
+    ctx: click.Context,
+    identifier: str | None,
+    scan: bool,
+    min_severity: str,
+    window_days: float,
+    min_snapshots: int,
+    notable_threshold: float,
+    limit: int | None,
+) -> None:
+    """Flag satellites whose latest TLE elements depart from a 7-day baseline.
+
+    Fits a linear trend per element (mean motion, eccentricity, inclination,
+    RAAN) over the last N days of TLE history, excluding the latest snapshot.
+    Reports the satellite with a z-score for the worst-offending element.
+
+    Without --scan, IDENTIFIER selects one satellite. With --scan, every
+    tracked Starlink with ≥ min-snapshots history is evaluated.
+    """
+    db_path: Path = ctx.obj["db_path"]
+
+    if scan:
+        with db.session(db_path) as conn:
+            findings = inspector_mod.scan(
+                conn,
+                window_days=window_days,
+                min_snapshots=min_snapshots,
+                notable_threshold=notable_threshold,
+                min_severity=min_severity,  # type: ignore[arg-type]
+            )
+        if not findings:
+            click.echo(f"No satellites flagged at severity >= {min_severity}.")
+            return
+        shown = findings[:limit] if limit else findings
+        click.echo(
+            f"{len(findings)} satellite(s) flagged at severity >= {min_severity}"
+            + (f" (showing first {len(shown)})" if limit and len(shown) < len(findings) else "")
+            + ":"
+        )
+        click.echo(
+            f"  {'SEVERITY':<12} {'NORAD':>6}  {'NAME':<20} "
+            f"{'ELEMENT':<13} {'Z':>7} {'OBSERVED':>12} {'EXPECTED':>12}"
+        )
+        for f in shown:
+            click.echo(
+                f"  {f.severity:<12} {f.norad_id:>6}  {f.name:<20} "
+                f"{f.element:<13} {f.z_score:>+7.2f} "
+                f"{f.observed:>12.6f} {f.expected:>12.6f}"
+            )
+        return
+
+    if not identifier:
+        click.echo("error: provide IDENTIFIER or use --scan", err=True)
+        sys.exit(1)
+
+    with db.session(db_path) as conn:
+        norad_id = find_satellite(conn, identifier)
+        if norad_id is None:
+            click.echo(f"error: no satellite matches {identifier!r}.", err=True)
+            sys.exit(1)
+        finding = inspector_mod.assess_satellite(
+            conn, norad_id,
+            window_days=window_days,
+            min_snapshots=min_snapshots,
+            notable_threshold=notable_threshold,
+        )
+
+    if finding is None:
+        click.echo(
+            f"NORAD {norad_id}: insufficient history "
+            f"(need ≥ {min_snapshots} snapshots in {window_days:.0f}d window)."
+        )
+        return
+
+    click.echo(f"{finding.name} (NORAD {finding.norad_id})  [{finding.severity.upper()}]")
+    click.echo(f"  window:         {finding.window_days:.2f}d, {finding.snapshots_used} snapshots")
+    click.echo(f"  worst element:  {finding.element}")
+    click.echo(f"  z-score:        {finding.z_score:+.3f}")
+    click.echo(f"  observed:       {finding.observed:.6f}")
+    click.echo(f"  expected:       {finding.expected:.6f}")
+    click.echo(f"  sigma used:     {finding.sigma:.4g}")
 
 
 if __name__ == "__main__":

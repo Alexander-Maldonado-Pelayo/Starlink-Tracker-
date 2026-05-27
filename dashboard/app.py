@@ -45,7 +45,9 @@ from spacetrack.tle.spacetrack_fetcher import (
     SpaceTrackError,
     fetch_starlink_for_range,
 )
+from spacetrack.anomaly import conjunction as conjunction_mod
 from spacetrack.anomaly import decay as decay_mod
+from spacetrack.anomaly import inspector as inspector_mod
 from spacetrack.anomaly import maneuver as maneuver_mod
 from spacetrack.viz.globe3d import render_globe
 from spacetrack.viz.groundtrack import render_ground_track
@@ -249,6 +251,113 @@ def cached_maneuver_events(min_magnitude: str, bucket_minute: int) -> list[dict]
     ]
 
 
+@st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
+def cached_inspector_findings(
+    min_severity: str,
+    window_days: float,
+    bucket_minute: int,
+) -> list[dict]:
+    """Inspector residual-scan results as cache-safe dicts."""
+    del bucket_minute
+    if not DB_PATH.exists():
+        return []
+    with db.session(DB_PATH) as conn:
+        findings = inspector_mod.scan(
+            conn,
+            window_days=window_days,
+            min_severity=min_severity,  # type: ignore[arg-type]
+        )
+    return [
+        {
+            "severity": f.severity,
+            "norad_id": f.norad_id,
+            "name": f.name,
+            "element": f.element,
+            "z_score": f.z_score,
+            "observed": f.observed,
+            "expected": f.expected,
+            "sigma": f.sigma,
+            "snapshots_used": f.snapshots_used,
+            "window_days": f.window_days,
+            "epoch": f.epoch,
+        }
+        for f in findings
+    ]
+
+
+@st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
+def cached_other_catalog_size() -> int:
+    if not DB_PATH.exists():
+        return 0
+    with db.session(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM satellites WHERE constellation = 'other'"
+        ).fetchone()[0]
+
+
+@st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
+def cached_conjunctions_per_sat(
+    norad_id: int,
+    hours_ahead: float,
+    max_distance_km: float,
+    cap: int,
+    step_seconds: float,
+    bucket_minute: int,
+) -> list[dict]:
+    """Per-satellite conjunction scan against the external catalog."""
+    del bucket_minute
+    if not DB_PATH.exists():
+        return []
+    with db.session(DB_PATH) as conn:
+        events = conjunction_mod.scan_satellite(
+            conn, norad_id,
+            forecast_hours=hours_ahead,
+            step_seconds=step_seconds,
+            max_distance_km=max_distance_km,
+            cap=cap,
+            secondary_constellation="other",
+        )
+    return [_conjunction_to_dict(e) for e in events]
+
+
+@st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
+def cached_conjunctions_scan(
+    primary_limit: int,
+    hours_ahead: float,
+    max_distance_km: float,
+    cap: int,
+    step_seconds: float,
+    bucket_minute: int,
+) -> list[dict]:
+    """Constellation-wide conjunction scan (capped for dashboard latency)."""
+    del bucket_minute
+    if not DB_PATH.exists():
+        return []
+    with db.session(DB_PATH) as conn:
+        events = conjunction_mod.scan(
+            conn,
+            forecast_hours=hours_ahead,
+            step_seconds=step_seconds,
+            max_distance_km=max_distance_km,
+            cap=cap,
+            primary_limit=primary_limit,
+        )
+    return [_conjunction_to_dict(e) for e in events]
+
+
+def _conjunction_to_dict(e: conjunction_mod.ConjunctionEvent) -> dict:
+    return {
+        "risk": e.risk,
+        "primary_norad_id": e.primary_norad_id,
+        "primary_name": e.primary_name,
+        "secondary_norad_id": e.secondary_norad_id,
+        "secondary_name": e.secondary_name,
+        "tca_unix": e.tca_unix,
+        "miss_distance_km": e.miss_distance_km,
+        "relative_velocity_km_s": e.relative_velocity_km_s,
+    }
+
+
 def _jd_to_datetime(jd: float) -> datetime:
     """Convert a Julian Date (TLE epoch) to UTC datetime."""
     return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=jd - 2440587.5)
@@ -421,10 +530,13 @@ sat_query = st.sidebar.text_input(
 # Tabs — globe / observer / track
 # ---------------------------------------------------------------------------
 
-tab_globe, tab_decay, tab_maneuver, tab_observer, tab_track = st.tabs([
+(tab_globe, tab_decay, tab_maneuver, tab_conj, tab_inspect,
+ tab_observer, tab_track) = st.tabs([
     "Constellation",
     "Decay Watch",
     "Maneuvers",
+    "Conjunctions",
+    "Inspector",
     "Observer · Sky plot",
     "Ground track",
 ])
@@ -677,6 +789,349 @@ with tab_maneuver:
                 "altitude_after_km": st.column_config.NumberColumn(
                     "Alt after (km)", format="%.1f",
                 ),
+            },
+        )
+
+with tab_conj:
+    st.subheader("Conjunction screening")
+    st.caption(
+        "Forecast close approaches between Starlink and CelesTrak's `active` "
+        "(non-Starlink) catalog. Risk tiers by miss distance: "
+        "**critical** (< 1 km) · **high** (< 2 km) · **medium** (< 5 km) · "
+        "**low** (< 10 km). Pre-screen drops pairs whose altitude shells "
+        "don't overlap; surviving pairs are SGP4-propagated and reduced to "
+        "their minimum 3-D ECI separation."
+    )
+
+    other_count = cached_other_catalog_size()
+    if other_count == 0:
+        st.warning(
+            "No external catalog loaded yet. Run "
+            "`spacetrack update-catalog` from a terminal to pull CelesTrak's "
+            "`active` group (≈ 5,000 non-Starlink sats). Conjunction "
+            "screening needs that catalog as the secondary set."
+        )
+    else:
+        st.caption(f"External catalog: **{other_count:,}** non-Starlink sats.")
+
+        cc1, cc2 = st.columns([1.2, 1.0])
+        mode = cc1.radio(
+            "Mode", ["Single satellite", "Constellation scan (preview)"],
+            horizontal=True,
+            help=(
+                "Single-sat: scan the satellite in the sidebar against the "
+                "external catalog. Preview scan: walk the first N Starlinks; "
+                "compute scales linearly with N."
+            ),
+        )
+        max_dist = cc2.slider(
+            "Max miss distance (km)", min_value=1.0, max_value=20.0,
+            value=10.0, step=0.5,
+            help="Drop pairs whose closest approach exceeds this.",
+        )
+
+        cc3, cc4, cc5 = st.columns(3)
+        hours_ahead = cc3.slider(
+            "Forecast window (h)", 1.0, 48.0, 24.0, step=1.0,
+            help="How far ahead to propagate.",
+        )
+        cap = cc4.slider(
+            "Candidates per primary", 5, 100, 25, step=5,
+            help="Cap on the altitude-pre-filtered candidate pool per primary.",
+        )
+        step_seconds = cc5.select_slider(
+            "Step (s)", options=[15, 30, 60, 120, 300], value=60,
+            help="Finer = more accurate TCA; heavier compute.",
+        )
+
+        events: list[dict]
+        if mode == "Single satellite":
+            resolved = find_named_sat(sat_query)
+            if resolved is None:
+                st.warning(f"No satellite matches `{sat_query}` in the database.")
+                events = []
+            else:
+                norad_id, sat_name, _, _ = resolved
+                with st.spinner(
+                    f"Screening {sat_name} vs {other_count:,} secondaries..."
+                ):
+                    events = cached_conjunctions_per_sat(
+                        norad_id, hours_ahead, max_dist, cap, float(step_seconds),
+                        minute_bucket,
+                    )
+                st.caption(
+                    f"Primary: **{sat_name}** (NORAD {norad_id})  ·  "
+                    f"forecast {hours_ahead:.0f}h, step {step_seconds}s"
+                )
+        else:
+            preview_n = st.slider(
+                "Primaries to scan", 5, 200, 25, step=5,
+                help=(
+                    "Full constellation scan is several minutes; the preview "
+                    "walks the first N Starlinks by NORAD ID."
+                ),
+            )
+            with st.spinner(
+                f"Scanning {preview_n} Starlinks vs {other_count:,} secondaries..."
+            ):
+                events = cached_conjunctions_scan(
+                    preview_n, hours_ahead, max_dist, cap, float(step_seconds),
+                    minute_bucket,
+                )
+            st.caption(
+                f"Preview scan: first **{preview_n}** Starlinks  ·  "
+                f"forecast {hours_ahead:.0f}h, step {step_seconds}s"
+            )
+
+        if not events:
+            st.info(
+                "No conjunctions surfaced under these settings. Below-threshold "
+                "close approaches against the active catalog are statistically "
+                "rare per-satellite over a 24h window — try a wider miss "
+                "distance, a longer window, or the constellation scan."
+            )
+        else:
+            counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+            for e in events:
+                counts[e["risk"]] = counts.get(e["risk"], 0) + 1
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Conjunctions", f"{len(events):,}")
+            c2.metric("Critical", counts["critical"])
+            c3.metric("High", counts["high"])
+            c4.metric("Medium", counts["medium"])
+            c5.metric("Low", counts["low"])
+
+            import plotly.graph_objects as go
+
+            _COLORS: dict[str, str] = {
+                "critical": "#ff3344",
+                "high":     "#ff8a5c",
+                "medium":   "#ffd166",
+                "low":      "#5af0a0",
+            }
+
+            fig_c = go.Figure()
+            for tier in ("critical", "high", "medium", "low"):
+                rows = [e for e in events if e["risk"] == tier]
+                if not rows:
+                    continue
+                fig_c.add_trace(go.Scatter(
+                    x=[datetime.fromtimestamp(r["tca_unix"], tz=timezone.utc)
+                       for r in rows],
+                    y=[r["miss_distance_km"] for r in rows],
+                    mode="markers",
+                    name=f"{tier} ({len(rows):,})",
+                    marker=dict(
+                        size=[max(8, 18 - 2 * r["miss_distance_km"]) for r in rows],
+                        color=_COLORS[tier],
+                        opacity=0.85,
+                        line=dict(width=0),
+                    ),
+                    text=[
+                        (
+                            f"<b>{r['primary_name']}</b> vs "
+                            f"{r['secondary_name']}<br>"
+                            f"miss = {r['miss_distance_km']:.3f} km<br>"
+                            f"rel v = {r['relative_velocity_km_s']:.3f} km/s"
+                        )
+                        for r in rows
+                    ],
+                    hoverinfo="text",
+                ))
+            fig_c.update_layout(
+                paper_bgcolor="#06090f",
+                plot_bgcolor="#06090f",
+                font=dict(color="#dde6f1"),
+                xaxis=dict(
+                    title="Time of closest approach (UTC)",
+                    gridcolor="#1c2735", zerolinecolor="#2a3a4f",
+                ),
+                yaxis=dict(
+                    title="Miss distance (km)  ·  lower = closer",
+                    gridcolor="#1c2735", zerolinecolor="#2a3a4f",
+                    autorange="reversed",
+                ),
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(
+                    bgcolor="rgba(6,9,15,0.7)",
+                    bordercolor="#2a3a4f", borderwidth=1,
+                ),
+                height=440,
+            )
+            st.plotly_chart(fig_c, width="stretch")
+
+            st.markdown("**Detected close approaches (most-critical first):**")
+            table_rows = [
+                {
+                    "risk": e["risk"],
+                    "primary": e["primary_name"],
+                    "secondary": e["secondary_name"],
+                    "miss_distance_km": round(e["miss_distance_km"], 3),
+                    "relative_velocity_km_s": round(e["relative_velocity_km_s"], 3),
+                    "tca_utc": datetime.fromtimestamp(
+                        e["tca_unix"], tz=timezone.utc,
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                for e in events
+            ]
+            st.dataframe(
+                table_rows,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "risk": st.column_config.TextColumn("Risk"),
+                    "primary": st.column_config.TextColumn("Primary"),
+                    "secondary": st.column_config.TextColumn("Secondary"),
+                    "miss_distance_km": st.column_config.NumberColumn(
+                        "Miss (km)", format="%.3f",
+                    ),
+                    "relative_velocity_km_s": st.column_config.NumberColumn(
+                        "Rel v (km/s)", format="%.3f",
+                    ),
+                    "tca_utc": st.column_config.TextColumn("TCA (UTC)"),
+                },
+            )
+
+with tab_inspect:
+    st.subheader("Inspector — orbital-element residual scan")
+    st.caption(
+        "Per-satellite outlier test: a linear trend is fitted to each of "
+        "four shape elements (mean motion, eccentricity, inclination, RAAN) "
+        "across the last N days of TLE history *excluding* the latest "
+        "snapshot. The latest snapshot is then scored against that baseline. "
+        "Catches station-keeping burns and plane tweaks too small for the "
+        "Maneuver detector. Severity tiers: **notable** (|z| ≥ 3) · "
+        "**significant** (|z| ≥ 5) · **extreme** (|z| ≥ 8)."
+    )
+
+    i1, i2 = st.columns([1.2, 1.0])
+    insp_min_sev = i1.radio(
+        "Minimum severity", ["notable", "significant", "extreme"],
+        index=1, horizontal=True,
+        help="'notable' is the rawest view; 'extreme' shows only the strongest outliers.",
+    )
+    insp_window = i2.slider(
+        "Baseline window (days)", 3.0, 14.0, 7.0, step=1.0,
+        help="Span of TLE history used to fit the trend.",
+    )
+
+    with st.spinner("Running inspector scan..."):
+        insp_rows = cached_inspector_findings(
+            insp_min_sev, insp_window, minute_bucket,
+        )
+
+    if not insp_rows:
+        st.info(
+            f"No satellites flagged at severity ≥ **{insp_min_sev}** in the last "
+            f"{insp_window:.0f} days of history. Loosen the severity or extend the window."
+        )
+    else:
+        counts = {"extreme": 0, "significant": 0, "notable": 0}
+        elem_counts: dict[str, int] = {}
+        for r in insp_rows:
+            counts[r["severity"]] = counts.get(r["severity"], 0) + 1
+            elem_counts[r["element"]] = elem_counts.get(r["element"], 0) + 1
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Flagged", f"{len(insp_rows):,}")
+        c2.metric("Extreme", counts["extreme"])
+        c3.metric("Significant", counts["significant"])
+        c4.metric("Notable", counts["notable"])
+
+        if elem_counts:
+            top_elem = max(elem_counts, key=elem_counts.get)
+            st.caption(
+                f"Dominant flagged element: **{top_elem}** "
+                f"({elem_counts[top_elem]} of {len(insp_rows)})."
+            )
+
+        import plotly.graph_objects as go
+
+        _COLORS_INSP: dict[str, str] = {
+            "extreme":     "#ff3344",
+            "significant": "#ff8a5c",
+            "notable":     "#ffd166",
+        }
+
+        fig_i = go.Figure()
+        for tier in ("extreme", "significant", "notable"):
+            rows = [r for r in insp_rows if r["severity"] == tier]
+            if not rows:
+                continue
+            fig_i.add_trace(go.Scatter(
+                x=[r["element"] for r in rows],
+                y=[r["z_score"] for r in rows],
+                mode="markers",
+                name=f"{tier} ({len(rows):,})",
+                marker=dict(
+                    size=10,
+                    color=_COLORS_INSP[tier],
+                    opacity=0.75,
+                    line=dict(width=0),
+                ),
+                text=[
+                    (
+                        f"<b>{r['name']}</b> (NORAD {r['norad_id']})<br>"
+                        f"{r['element']} z = {r['z_score']:+.2f}<br>"
+                        f"obs = {r['observed']:.6f}<br>"
+                        f"exp = {r['expected']:.6f}<br>"
+                        f"σ = {r['sigma']:.4g}"
+                    )
+                    for r in rows
+                ],
+                hoverinfo="text",
+            ))
+        fig_i.add_hline(y=0, line_color="#3a4a60", line_width=1)
+        fig_i.update_layout(
+            paper_bgcolor="#06090f",
+            plot_bgcolor="#06090f",
+            font=dict(color="#dde6f1"),
+            xaxis=dict(
+                title="Worst-offending element",
+                gridcolor="#1c2735", zerolinecolor="#2a3a4f",
+                categoryorder="array",
+                categoryarray=list(inspector_mod.ELEMENTS),
+            ),
+            yaxis=dict(
+                title="Z-score of latest residual vs prior-trend baseline",
+                gridcolor="#1c2735", zerolinecolor="#2a3a4f",
+            ),
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(
+                bgcolor="rgba(6,9,15,0.7)",
+                bordercolor="#2a3a4f", borderwidth=1,
+            ),
+            height=420,
+        )
+        st.plotly_chart(fig_i, width="stretch")
+
+        st.markdown("**Flagged satellites (most-extreme first):**")
+        table_rows = [
+            {
+                "severity": r["severity"],
+                "norad_id": r["norad_id"],
+                "name": r["name"],
+                "element": r["element"],
+                "z_score": round(r["z_score"], 2),
+                "observed": round(r["observed"], 6),
+                "expected": round(r["expected"], 6),
+                "snapshots_used": r["snapshots_used"],
+            }
+            for r in insp_rows
+        ]
+        st.dataframe(
+            table_rows,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "severity": st.column_config.TextColumn("Severity"),
+                "norad_id": st.column_config.NumberColumn("NORAD", format="%d"),
+                "name": st.column_config.TextColumn("Name"),
+                "element": st.column_config.TextColumn("Element"),
+                "z_score": st.column_config.NumberColumn("z-score", format="%+.2f"),
+                "observed": st.column_config.NumberColumn("Observed", format="%.6f"),
+                "expected": st.column_config.NumberColumn("Expected", format="%.6f"),
+                "snapshots_used": st.column_config.NumberColumn("Snaps", format="%d"),
             },
         )
 
