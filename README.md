@@ -4,7 +4,7 @@ A Python tool that tracks the Starlink constellation in near-real-time and appli
 cybersecurity-style anomaly detection to spot conjunctions, unannounced maneuvers,
 suspicious proximity events, and orbital decay.
 
-**Status:** Phases 1 (foundation), 2 (visualization), and 2.5 (live modes — dashboard, terminal stream, scheduled updates) complete. Phase 3 (anomaly detection) is next. See [notes/07-status.md](notes/07-status.md) for the running log.
+**Status:** Phases 1 (foundation), 2 (visualization), 2.5 (live modes — dashboard, terminal stream, scheduled updates), and 3 (anomaly detection — conjunction, maneuver, inspector, decay) complete. The detectors now persist findings to a queryable timeline via `spacetrack scan`, refreshed on a schedule, surfaced in the dashboard's **Anomaly Feed** tab. See [notes/07-status.md](notes/07-status.md) for the running log.
 
 ## Live demo
 
@@ -21,8 +21,10 @@ To run locally, launch with `spacetrack dashboard` and open:
 
 ```powershell
 # from the project root, with the venv activated:
-spacetrack update                    # pull 10,315 live Starlink TLEs
+spacetrack update                    # pull live Starlink TLEs from CelesTrak
+spacetrack update-catalog            # pull the non-Starlink catalog + debris clouds
 spacetrack stats                     # see what's stored
+spacetrack scan                      # run all 4 detectors, persist findings to the anomaly timeline
 spacetrack where STARLINK-1008       # current position of one sat
 spacetrack globe --open              # render the whole constellation in 3D
 spacetrack track STARLINK-1008 --open   # ground track over the next 2 orbits
@@ -64,8 +66,17 @@ deviations become tractable to detect with public data alone.
 
 The Streamlit Cloud deploy reads from [Turso](https://turso.tech) (cloud
 SQLite), and a GitHub Action repopulates that database every two hours from
-CelesTrak. Users never wait on a live Space-Track fetch — the dashboard's
-DB is always already current. To set this up on a fork:
+CelesTrak. Each refresh also runs `spacetrack scan`, which executes all four
+detectors and writes findings to the `anomalies` table — so the dashboard's
+**Anomaly Feed** shows an accumulating record of conjunctions, maneuvers,
+element residuals, and decay events, not just a live snapshot. Findings carry
+a stable fingerprint, so re-running the scan is idempotent: the timeline grows
+only when genuinely new events appear. (The constellation-wide detectors run
+every refresh; conjunction screening sweeps a rotating slice of the
+constellation each run, covering the whole fleet on a rolling basis.)
+
+Users never wait on a live Space-Track fetch — the dashboard's DB is always
+already current. To set this up on a fork:
 
 1. **Create a Turso DB** — `turso db create starlink-watch`, then capture
    the URL (`turso db show starlink-watch`) and an auth token

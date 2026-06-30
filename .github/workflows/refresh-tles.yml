@@ -12,10 +12,10 @@ name: Refresh TLE catalog
 #   SPACETRACK_PASSWORD    Space-Track.org password
 
 on:
-  # Every 2 hours on the hour — matches CelesTrak's publish cadence.
+  # Hands-free refresh every two hours, plus on-demand from
+  # Actions ▸ Refresh TLE catalog ▸ Run workflow (or `gh workflow run`).
   schedule:
     - cron: "0 */2 * * *"
-  # Manual trigger for backfills or post-outage catch-up.
   workflow_dispatch:
 
 # Cancel an in-flight run if a new one starts, to avoid stepping on ourselves.
@@ -26,7 +26,7 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       TURSO_URL: ${{ secrets.TURSO_URL }}
       TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
@@ -57,6 +57,36 @@ jobs:
       - name: Refresh non-Starlink catalog (CelesTrak `active` group)
         continue-on-error: true
         run: spacetrack update-catalog
+
+      # Run the cheap, constellation-wide detectors (maneuver, inspector,
+      # decay) on every refresh. ~15 s for the whole constellation; commits in
+      # its own transaction so it can't be rolled back by a slow conjunction
+      # sweep below.
+      - name: Detect maneuvers / residuals / decay (full constellation)
+        continue-on-error: true
+        run: spacetrack scan --no-conjunction
+
+      # Conjunction screening is several seconds/primary against the full
+      # debris-inclusive catalog — too slow to cover all ~10k Starlink per run.
+      # Screen a rotating window of 250 primaries; the offset advances with the
+      # run number so successive runs sweep the whole constellation on a rolling
+      # basis (~every 3-4 days at this cadence). The step has its own timeout
+      # and continue-on-error so a long sweep can never fail the job or block
+      # the stats report — the cheap detectors above already committed.
+      - name: Screen conjunctions (rotating window)
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          WINDOW: "250"
+        run: |
+          OFFSET=$(( RUN_NUMBER * WINDOW ))
+          echo "Conjunction window: ${WINDOW} primaries from offset ${OFFSET}"
+          spacetrack scan \
+            --no-maneuver --no-inspector --no-decay \
+            --conjunction-min-risk medium \
+            --conjunction-primary-limit "${WINDOW}" \
+            --conjunction-primary-offset "${OFFSET}"
 
       - name: Report final DB stats
         run: spacetrack stats

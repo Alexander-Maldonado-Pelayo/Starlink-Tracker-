@@ -32,7 +32,12 @@ from spacetrack.observer.visibility import (
 )
 from spacetrack.propagate.sgp4_engine import propagate_many, propagate_track
 from spacetrack.storage import db
-from spacetrack.storage.queries import find_satellite, get_latest_tle
+from spacetrack.storage.queries import (
+    anomaly_counts_by_type,
+    find_satellite,
+    get_latest_tle,
+    recent_anomalies,
+)
 from spacetrack.storage.snapshot import write_snapshots
 from spacetrack.tle.fetcher import (
     FetchError,
@@ -54,6 +59,17 @@ from spacetrack.viz.groundtrack import render_ground_track
 from spacetrack.viz.skyplot import HORIZON_DEG, PRACTICAL_DEG, render_sky
 
 DB_PATH = Path("data/spacetrack.db")
+
+
+def _db_ready() -> bool:
+    """True when there's a database to read from.
+
+    Turso (production) is reachable purely from env vars — there's no local
+    file — so a bare ``DB_PATH.exists()`` check would wrongly report "no data"
+    on the Cloud deploy. Treat a configured Turso connection as ready.
+    """
+    return bool(os.environ.get("TURSO_URL")) or DB_PATH.exists()
+
 
 # How often the page auto-reloads via meta-refresh. Long enough that user
 # interaction (3D rotation, scroll position, dropdown state) isn't constantly
@@ -302,6 +318,78 @@ def cached_inspector_findings(
 
 
 @st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
+def cached_anomaly_feed(
+    types: tuple[str, ...],
+    since_days: int,
+    bucket_minute: int,
+) -> list[dict]:
+    """Persisted anomalies (written by `spacetrack scan`) as cache-safe dicts.
+
+    Reads the accumulating ``anomalies`` table — the longitudinal record — not
+    a live detector run, so the feed reflects everything flagged over time.
+    """
+    del bucket_minute
+    if not _db_ready():
+        return []
+    since_unix = int(datetime.now(timezone.utc).timestamp()) - since_days * 86400
+    with db.session(DB_PATH) as conn:
+        records = recent_anomalies(
+            conn,
+            types=list(types) if types else None,
+            since_unix=since_unix,
+            limit=2000,
+        )
+    out: list[dict] = []
+    for r in records:
+        d = r.details or {}
+        out.append({
+            "detected_at": r.detected_at,
+            "type": r.type,
+            "severity": r.severity,
+            "primary_id": r.primary_id,
+            "secondary_id": r.secondary_id,
+            "name": d.get("name") or d.get("primary_name") or "",
+            "summary": _anomaly_summary(r.type, d),
+        })
+    return out
+
+
+@st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
+def cached_anomaly_counts(since_days: int, bucket_minute: int) -> dict[str, int]:
+    del bucket_minute
+    if not _db_ready():
+        return {}
+    since_unix = int(datetime.now(timezone.utc).timestamp()) - since_days * 86400
+    with db.session(DB_PATH) as conn:
+        return anomaly_counts_by_type(conn, since_unix=since_unix)
+
+
+def _anomaly_summary(kind: str, d: dict) -> str:
+    """One-line, analyst-readable description of a persisted anomaly."""
+    if kind == "conjunction":
+        return (
+            f"vs {d.get('secondary_name', '?')} — miss "
+            f"{d.get('miss_distance_km', '?')} km @ {d.get('relative_velocity_km_s', '?')} km/s"
+        )
+    if kind == "maneuver":
+        return (
+            f"{d.get('direction', '?')} "
+            f"{d.get('altitude_before_km', '?')}→{d.get('altitude_after_km', '?')} km "
+            f"(Δa {d.get('delta_a_km', '?')} km)"
+        )
+    if kind == "inspector":
+        return (
+            f"{d.get('element', '?')} z={d.get('z_score', '?')} "
+            f"(obs {d.get('observed', '?')} vs exp {d.get('expected', '?')})"
+        )
+    if kind == "decay":
+        dtr = d.get("days_to_reentry")
+        tail = f", ~{dtr}d to reentry" if dtr is not None else ""
+        return f"perigee {d.get('perigee_km', '?')} km{tail}"
+    return ""
+
+
+@st.cache_data(ttl=DATA_CACHE_SECONDS, show_spinner=False)
 def cached_other_catalog_size() -> int:
     if not DB_PATH.exists():
         return 0
@@ -546,9 +634,10 @@ sat_query = st.sidebar.text_input(
 # Tabs — globe / observer / track
 # ---------------------------------------------------------------------------
 
-(tab_globe, tab_decay, tab_maneuver, tab_conj, tab_inspect,
+(tab_globe, tab_feed, tab_decay, tab_maneuver, tab_conj, tab_inspect,
  tab_observer, tab_track) = st.tabs([
     "Constellation",
+    "Anomaly Feed",
     "Decay Watch",
     "Maneuvers",
     "Conjunctions",
@@ -606,6 +695,77 @@ with tab_globe:
         thin_nominal=thin_n,
     )
     st.plotly_chart(fig, width="stretch", height=720)
+
+with tab_feed:
+    st.subheader("Anomaly feed")
+    st.caption(
+        "The accumulating record of everything the four detectors have flagged "
+        "over time — written by the scheduled `spacetrack scan`, not a live "
+        "one-shot. This is the constellation's behavioural history: conjunctions, "
+        "maneuvers, element residuals, and decay events as they were detected."
+    )
+
+    f1, f2 = st.columns([1.4, 1.0])
+    window_label = f1.radio(
+        "Time window", ["7 days", "30 days", "90 days", "All"],
+        index=1, horizontal=True,
+    )
+    since_days = {"7 days": 7, "30 days": 30, "90 days": 90, "All": 36500}[window_label]
+    type_choice = f2.multiselect(
+        "Detector",
+        ["conjunction", "maneuver", "inspector", "decay"],
+        default=["conjunction", "maneuver", "inspector", "decay"],
+        help="Filter the feed by detector type.",
+    )
+
+    counts = cached_anomaly_counts(since_days, minute_bucket)
+    if not counts:
+        st.info(
+            "No anomalies recorded yet. The scheduled `spacetrack scan` "
+            "populates this feed after each refresh — run "
+            "`spacetrack scan` locally, or wait for the next GitHub Action run."
+        )
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Conjunctions", counts.get("conjunction", 0))
+        c2.metric("Maneuvers", counts.get("maneuver", 0))
+        c3.metric("Inspector flags", counts.get("inspector", 0))
+        c4.metric("Decay events", counts.get("decay", 0))
+
+        feed = cached_anomaly_feed(tuple(sorted(type_choice)), since_days, minute_bucket)
+        if not feed:
+            st.info("No anomalies of the selected type(s) in this window.")
+        else:
+            import pandas as pd
+            import plotly.express as px
+
+            df = pd.DataFrame(feed)
+            df["detected"] = pd.to_datetime(df["detected_at"], unit="s", utc=True)
+            df["day"] = df["detected"].dt.floor("D")
+
+            # Detections per day, stacked by detector type — the "bigger picture".
+            timeline = (
+                df.groupby(["day", "type"]).size().reset_index(name="count")
+            )
+            fig_tl = px.bar(
+                timeline, x="day", y="count", color="type",
+                title="Detections per day", height=320,
+            )
+            fig_tl.update_layout(margin=dict(l=10, r=10, t=40, b=10),
+                                 legend_title_text="")
+            st.plotly_chart(fig_tl, width="stretch")
+
+            st.markdown(f"**{len(df):,} events** in the last {window_label.lower()} "
+                        "(most recent first)")
+            table = df[[
+                "detected", "type", "severity", "primary_id",
+                "secondary_id", "name", "summary",
+            ]].rename(columns={
+                "detected": "Detected (UTC)", "type": "Type",
+                "severity": "Severity", "primary_id": "Primary",
+                "secondary_id": "Secondary", "name": "Name", "summary": "Detail",
+            })
+            st.dataframe(table, width="stretch", hide_index=True, height=460)
 
 with tab_decay:
     st.subheader("Re-entry risk watch")

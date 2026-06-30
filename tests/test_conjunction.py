@@ -131,6 +131,63 @@ def _checksum(line: str) -> str:
     return line[:68] + str(total % 10)
 
 
+# --- Rotating primary window (rolling coverage for scheduled scans) ---------
+
+def _seed_overlapping_constellation(p):
+    """Seed several Starlink primaries + a couple secondaries, all sharing one
+    altitude shell so every primary has candidates."""
+    from spacetrack.storage import db
+    db.init_db(p)
+    with db.session(p) as conn:
+        for nid, const in (
+            *((100 + i, "starlink") for i in range(5)),
+            (900, "other"), (901, "other"),
+        ):
+            conn.execute(
+                "INSERT INTO satellites (norad_id, name, constellation) VALUES (?, ?, ?)",
+                (nid, f"SAT-{nid}", const),
+            )
+            conn.execute(
+                """
+                INSERT INTO tle_snapshots
+                    (norad_id, epoch, fetched_at, line1, line2,
+                     eccentricity, mean_motion)
+                VALUES (?, ?, ?, 'L1', 'L2', ?, ?)
+                """,
+                (nid, 2461170.0, 100, 0.0001, 15.07),
+            )
+
+
+def test_scan_primary_offset_rotates_window(tmp_path, monkeypatch):
+    from spacetrack.storage import db
+    p = tmp_path / "rot.db"
+    _seed_overlapping_constellation(p)
+
+    screened: list[str] = []
+
+    def _fake_cpa(l1, l2, name_a, *args, **kwargs):
+        screened.append(name_a)
+        return (1e9, datetime(2024, 5, 24, tzinfo=timezone.utc), 0.0)  # no event
+
+    monkeypatch.setattr(conjunction, "find_closest_approach", _fake_cpa)
+
+    with db.session(p) as conn:
+        conjunction.scan(conn, primary_limit=2, primary_offset=0)
+        first = sorted(set(screened))
+        screened.clear()
+        conjunction.scan(conn, primary_limit=2, primary_offset=2)
+        second = sorted(set(screened))
+        screened.clear()
+        conjunction.scan(conn, primary_limit=2, primary_offset=4)
+        wrapped = sorted(set(screened))
+
+    # Sorted by NORAD id: [100,101,102,103,104].
+    assert first == ["SAT-100", "SAT-101"]
+    assert second == ["SAT-102", "SAT-103"]
+    # offset=4 wraps: window is [104, 100].
+    assert wrapped == ["SAT-100", "SAT-104"]
+
+
 def test_identical_orbits_have_near_zero_miss_distance():
     """Two sats with the same TLE must trace identical orbits — miss = 0."""
     l1 = _checksum(_STARLINK_L1[:68])

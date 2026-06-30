@@ -68,7 +68,11 @@ CREATE TABLE IF NOT EXISTS anomalies (
     severity     TEXT    NOT NULL,
     primary_id   INTEGER,
     secondary_id INTEGER,
-    details      TEXT
+    details      TEXT,
+    -- Stable per-event key so re-running `scan` on every refresh doesn't
+    -- duplicate the same conjunction/maneuver in the timeline. See
+    -- spacetrack.anomaly.persist for how each detector's fingerprint is built.
+    fingerprint  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_anomalies_detected_at
@@ -77,6 +81,29 @@ CREATE INDEX IF NOT EXISTS idx_anomalies_detected_at
 CREATE INDEX IF NOT EXISTS idx_anomalies_type
     ON anomalies(type);
 """
+# Note: the UNIQUE index on anomalies(fingerprint) is created by
+# _migrate_anomalies_fingerprint, not here — a database created before the
+# fingerprint column existed would fail this statement inside executescript()
+# before the ALTER TABLE has a chance to run.
+
+
+def _migrate_anomalies_fingerprint(conn: Any) -> None:
+    """Add the ``fingerprint`` column to a pre-existing ``anomalies`` table.
+
+    Idempotent: a no-op once the column exists. Needed because the production
+    Turso database was created before the fingerprint column existed; a plain
+    ``CREATE TABLE IF NOT EXISTS`` won't alter the live table. SQLite/libsql
+    both support ``ALTER TABLE ... ADD COLUMN``.
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(anomalies)").fetchall()]
+    if not cols:
+        return  # table doesn't exist yet; SCHEMA will create it with the column
+    if "fingerprint" not in cols:
+        conn.execute("ALTER TABLE anomalies ADD COLUMN fingerprint TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_anomalies_fingerprint "
+        "ON anomalies(fingerprint)"
+    )
 
 
 def _use_turso() -> bool:
@@ -241,6 +268,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_anomalies_fingerprint(conn)
         conn.commit()
     finally:
         conn.close()

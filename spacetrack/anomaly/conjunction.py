@@ -356,6 +356,7 @@ def scan(
     primary_constellation: str = "starlink",
     secondary_constellation: str | None = "other",
     primary_limit: int | None = None,
+    primary_offset: int = 0,
 ) -> list[ConjunctionEvent]:
     """Full-catalog conjunction screen.
 
@@ -363,6 +364,13 @@ def scan(
     keeps the ``cap`` nearest-shell candidates per primary, and propagates
     those over the forecast window. Set ``primary_limit`` to bound compute
     on very large primary sets (handy for dashboard previews).
+
+    A brute-force screen of the whole constellation is far too slow for a
+    scheduled job (~2 s/primary). For rolling coverage, run with a
+    ``primary_limit`` window and advance ``primary_offset`` each run: primaries
+    are sorted by NORAD id and the window wraps around, so successive scans
+    sweep the full constellation over several runs without rescanning the same
+    slice every time.
 
     Results are sorted by risk tier, then by miss distance ascending.
     """
@@ -376,6 +384,12 @@ def scan(
     else:
         secondary_pool = [r for r in pool_all if r.constellation == secondary_constellation]
 
+    # Stable order so a rotating (offset, limit) window gives reproducible,
+    # gap-free coverage across successive scheduled runs.
+    primaries.sort(key=lambda r: r.norad_id)
+    if primaries and primary_offset:
+        off = primary_offset % len(primaries)
+        primaries = primaries[off:] + primaries[:off]
     if primary_limit is not None:
         primaries = primaries[:primary_limit]
 

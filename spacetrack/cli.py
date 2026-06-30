@@ -15,6 +15,7 @@ from spacetrack.anomaly import conjunction as conjunction_mod
 from spacetrack.anomaly import decay as decay_mod
 from spacetrack.anomaly import inspector as inspector_mod
 from spacetrack.anomaly import maneuver as maneuver_mod
+from spacetrack.anomaly import persist as persist_mod
 from spacetrack.live import live_sample
 from spacetrack.observer.visibility import (
     ObserverLocation,
@@ -30,7 +31,13 @@ from spacetrack.propagate.sgp4_engine import (
 from spacetrack.storage import db
 from spacetrack.storage.queries import find_satellite, get_latest_tle
 from spacetrack.storage.snapshot import write_external_catalog, write_snapshots
-from spacetrack.tle.fetcher import NoNewData, fetch_active, fetch_starlink, now_unix
+from spacetrack.tle.fetcher import (
+    DEFAULT_CATALOG_GROUPS,
+    NoNewData,
+    fetch_catalog_groups,
+    fetch_starlink,
+    now_unix,
+)
 from spacetrack.tle.spacetrack_fetcher import (
     SpaceTrackAuthError,
     SpaceTrackError,
@@ -804,32 +811,41 @@ def maneuver(
 
 
 @main.command("update-catalog")
+@click.option("--debris/--no-debris", default=True, show_default=True,
+              help="Include the major LEO debris clouds (Cosmos-1408, "
+                   "Fengyun-1C, Iridium-33, Cosmos-2251) alongside the active "
+                   "catalog — the objects that dominate real conjunction risk.")
 @click.pass_context
-def update_catalog(ctx: click.Context) -> None:
-    """Fetch CelesTrak's `active` catalog (non-Starlink) for conjunction screening.
+def update_catalog(ctx: click.Context, debris: bool) -> None:
+    """Fetch the non-Starlink catalog (CelesTrak) for conjunction screening.
 
-    Stored under constellation='other'. Skips NORAD IDs already tagged
-    'starlink' so the upsert doesn't clobber the constellation label.
+    By default pulls operational satellites (`active`) plus the major tracked
+    debris clouds, merged and deduped. Stored under constellation='other';
+    skips NORAD IDs already tagged 'starlink' so the upsert doesn't clobber the
+    constellation label. Use --no-debris for the operational-only catalog.
     """
     db_path: Path = ctx.obj["db_path"]
     fetched_at = now_unix()
 
+    groups = DEFAULT_CATALOG_GROUPS if debris else ("active",)
     try:
-        tles = fetch_active()
-    except NoNewData as exc:
-        click.echo(str(exc))
-        return
+        tles = fetch_catalog_groups(groups)
     except Exception as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(1)
+
+    if not tles:
+        click.echo("No catalog data received (all groups unchanged or failed).")
+        return
 
     with db.session(db_path) as conn:
         new_count, total, skipped = write_external_catalog(
             conn, tles, fetched_at=fetched_at, constellation="other",
         )
 
+    scope = "active + debris clouds" if debris else "active only"
     click.echo(
-        f"Catalog refresh: {total:,} active TLEs received, "
+        f"Catalog refresh ({scope}): {total:,} TLEs received, "
         f"{new_count:,} new ({skipped:,} skipped as already-tracked Starlink)."
     )
 
@@ -1068,6 +1084,99 @@ def inspector(
     click.echo(f"  observed:       {finding.observed:.6f}")
     click.echo(f"  expected:       {finding.expected:.6f}")
     click.echo(f"  sigma used:     {finding.sigma:.4g}")
+
+
+@main.command()
+@click.option("--conjunction/--no-conjunction", "do_conjunction", default=True,
+              show_default=True, help="Run the conjunction detector (heaviest).")
+@click.option("--maneuver/--no-maneuver", "do_maneuver", default=True,
+              show_default=True, help="Run the maneuver detector.")
+@click.option("--inspector/--no-inspector", "do_inspector", default=True,
+              show_default=True, help="Run the inspector (residual) detector.")
+@click.option("--decay/--no-decay", "do_decay", default=True,
+              show_default=True, help="Run the decay detector.")
+@click.option("--conjunction-min-risk",
+              type=click.Choice(["low", "medium", "high", "critical"]),
+              default="medium", show_default=True,
+              help="Minimum conjunction risk tier to record.")
+@click.option("--conjunction-primary-limit", type=int, default=None,
+              help="Cap primaries screened for conjunctions (faster preview "
+                   "scans; omit to screen the whole constellation).")
+@click.option("--conjunction-primary-offset", type=int, default=0,
+              show_default=True,
+              help="Start the conjunction primary window at this offset "
+                   "(wraps around). Advance each scheduled run for rolling "
+                   "full-constellation coverage.")
+@click.option("--maneuver-min-magnitude",
+              type=click.Choice(["small", "medium", "large"]),
+              default="small", show_default=True,
+              help="Minimum maneuver magnitude to record.")
+@click.option("--inspector-min-severity",
+              type=click.Choice(["notable", "significant", "extreme"]),
+              default="notable", show_default=True,
+              help="Minimum inspector severity to record.")
+@click.option("--decay-min-risk",
+              type=click.Choice(["elevated", "high", "imminent"]),
+              default="elevated", show_default=True,
+              help="Minimum decay risk tier to record.")
+@click.pass_context
+def scan(
+    ctx: click.Context,
+    do_conjunction: bool,
+    do_maneuver: bool,
+    do_inspector: bool,
+    do_decay: bool,
+    conjunction_min_risk: str,
+    conjunction_primary_limit: int | None,
+    conjunction_primary_offset: int,
+    maneuver_min_magnitude: str,
+    inspector_min_severity: str,
+    decay_min_risk: str,
+) -> None:
+    """Run every detector and persist findings to the anomalies table.
+
+    This is the command that turns point-in-time detection into an
+    accumulating record. Designed to run on a schedule (e.g. the refresh
+    GitHub Action) after each TLE update: findings carry a stable fingerprint
+    so re-running on the same data is idempotent — the timeline grows only
+    when genuinely new events appear.
+    """
+    db_path: Path = ctx.obj["db_path"]
+    detected_at = now_unix()
+
+    # Ensure the fingerprint column/index exists on pre-existing databases.
+    db.init_db(db_path)
+
+    with db.session(db_path) as conn:
+        summary = persist_mod.run_scan(
+            conn,
+            detected_at=detected_at,
+            run_conjunction=do_conjunction,
+            run_maneuver=do_maneuver,
+            run_inspector=do_inspector,
+            run_decay=do_decay,
+            conjunction_min_risk=conjunction_min_risk,
+            conjunction_primary_limit=conjunction_primary_limit,
+            conjunction_primary_offset=conjunction_primary_offset,
+            maneuver_min_magnitude=maneuver_min_magnitude,
+            inspector_min_severity=inspector_min_severity,
+            decay_min_risk=decay_min_risk,
+        )
+
+    stamp = datetime.fromtimestamp(detected_at, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+    click.echo(f"Scan @ {stamp}")
+    click.echo(f"  {'DETECTOR':<13} {'FOUND':>7} {'NEW':>7}")
+    for det in ("conjunction", "maneuver", "inspector", "decay"):
+        if det not in summary.found_by_type:
+            continue
+        click.echo(
+            f"  {det:<13} {summary.found_by_type[det]:>7} "
+            f"{summary.new_by_type.get(det, 0):>7}"
+        )
+    click.echo(f"  {'-'*29}")
+    click.echo(f"  {'total new':<13} {'':>7} {summary.total_new:>7}")
 
 
 if __name__ == "__main__":

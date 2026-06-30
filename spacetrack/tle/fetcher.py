@@ -98,6 +98,61 @@ def fetch_active(*, timeout: float = 30.0) -> list[ParsedTLE]:
     return parsed
 
 
+# Major tracked debris/collision clouds in LEO. These are the objects that
+# dominate real conjunction risk for a constellation in the 500–600 km shells —
+# the ASAT-test and accidental-collision debris fields that Space Domain
+# Awareness operators screen against. Operational satellites ('active') alone
+# miss the bulk of the actual hazard population.
+DEBRIS_GROUPS: tuple[str, ...] = (
+    "cosmos-1408-debris",   # 2021 Russian ASAT test (~1500 tracked pieces, LEO)
+    "fengyun-1c-debris",    # 2007 Chinese ASAT test (largest tracked cloud)
+    "iridium-33-debris",    # 2009 Iridium–Cosmos collision
+    "cosmos-2251-debris",   # 2009 Iridium–Cosmos collision (other body)
+)
+
+# Default catalog used for conjunction screening: operational sats + the major
+# debris clouds.
+DEFAULT_CATALOG_GROUPS: tuple[str, ...] = ("active",) + DEBRIS_GROUPS
+
+
+def fetch_catalog_groups(
+    groups: tuple[str, ...] = DEFAULT_CATALOG_GROUPS,
+    *,
+    timeout: float = 30.0,
+) -> list[ParsedTLE]:
+    """Fetch several CelesTrak groups and merge into one deduped catalog.
+
+    Each group is fetched independently; a group that 403s (NoNewData) or
+    errors is logged and skipped rather than aborting the whole catalog — a
+    single stale or renamed debris group shouldn't sink the refresh. TLEs are
+    deduped by NORAD id (first occurrence wins, so 'active' takes precedence
+    over a debris-group duplicate).
+    """
+    by_norad: dict[int, ParsedTLE] = {}
+    fetched_groups: list[str] = []
+    for group in groups:
+        try:
+            raw = fetch_group(group, timeout=timeout)
+        except NoNewData as exc:
+            log.info("Group %s unchanged, skipping: %s", group, exc)
+            continue
+        except FetchError as exc:
+            log.warning("Group %s failed, skipping: %s", group, exc)
+            continue
+        added = 0
+        for tle in parse_block(raw):
+            if tle.norad_id not in by_norad:
+                by_norad[tle.norad_id] = tle
+                added += 1
+        fetched_groups.append(f"{group}(+{added})")
+
+    log.info(
+        "Catalog merge: %d unique objects from %d/%d groups [%s]",
+        len(by_norad), len(fetched_groups), len(groups), ", ".join(fetched_groups),
+    )
+    return list(by_norad.values())
+
+
 def load_bundled_seed() -> list[ParsedTLE]:
     """Return the bundled Starlink TLE snapshot.
 

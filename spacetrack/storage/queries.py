@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -67,3 +69,83 @@ def get_latest_tle(conn: sqlite3.Connection, norad_id: int) -> LatestTLE | None:
         epoch=row["epoch"],
         fetched_at=row["fetched_at"],
     )
+
+
+@dataclass(frozen=True)
+class AnomalyRecord:
+    id: int
+    detected_at: int       # unix ts when the scan recorded it
+    type: str              # conjunction | maneuver | inspector | decay
+    severity: str
+    primary_id: int | None
+    secondary_id: int | None
+    details: dict[str, Any]
+
+
+def recent_anomalies(
+    conn: Any,
+    *,
+    types: list[str] | None = None,
+    since_unix: int | None = None,
+    limit: int | None = 500,
+) -> list[AnomalyRecord]:
+    """Read persisted anomalies for the dashboard feed, newest first.
+
+    Optionally filter by detector ``types`` and a ``since_unix`` lower bound on
+    ``detected_at``. ``details`` is decoded from its stored JSON.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if types:
+        placeholders = ",".join("?" for _ in types)
+        clauses.append(f"type IN ({placeholders})")
+        params.extend(types)
+    if since_unix is not None:
+        clauses.append("detected_at >= ?")
+        params.append(since_unix)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        "SELECT id, detected_at, type, severity, primary_id, secondary_id, details "
+        f"FROM anomalies {where} ORDER BY detected_at DESC, id DESC"
+    )
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    out: list[AnomalyRecord] = []
+    for row in conn.execute(sql, tuple(params)).fetchall():
+        raw = row["details"]
+        try:
+            details = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            details = {}
+        out.append(
+            AnomalyRecord(
+                id=row["id"],
+                detected_at=row["detected_at"],
+                type=row["type"],
+                severity=row["severity"],
+                primary_id=row["primary_id"],
+                secondary_id=row["secondary_id"],
+                details=details,
+            )
+        )
+    return out
+
+
+def anomaly_counts_by_type(
+    conn: Any, *, since_unix: int | None = None
+) -> dict[str, int]:
+    """Return {type: count} of persisted anomalies, optionally since a time."""
+    if since_unix is not None:
+        rows = conn.execute(
+            "SELECT type, COUNT(*) AS n FROM anomalies "
+            "WHERE detected_at >= ? GROUP BY type",
+            (since_unix,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT type, COUNT(*) AS n FROM anomalies GROUP BY type"
+        ).fetchall()
+    return {row["type"]: row["n"] for row in rows}
