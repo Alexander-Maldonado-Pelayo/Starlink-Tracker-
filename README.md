@@ -13,9 +13,21 @@ suspicious proximity events, and orbital decay.
 Public deployment on Streamlit Cloud — no install required. Data is
 propagated from the most recent TLE snapshot.
 
-To run locally, launch with `spacetrack dashboard` and open:
+### Run it locally
 
-**[http://localhost:8501](http://localhost:8501)**
+One command spins up a fully self-contained demo — it seeds from a bundled
+~10,000-satellite snapshot, so it renders instantly and works even with no
+network:
+
+```powershell
+.\scripts\demo.ps1        # Windows (PowerShell)
+```
+```bash
+./scripts/demo.sh         # macOS / Linux
+```
+
+Then open **[http://localhost:8501](http://localhost:8501)**. See
+[DEMO.md](DEMO.md) for a walkthrough of each tab and manual setup steps.
 
 ## Quickstart
 
