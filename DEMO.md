@@ -78,6 +78,37 @@ seven tabs still work fully from the bundled snapshot.
 
 ---
 
+## Give someone a link via GitHub Pages (no install, no account)
+
+The repo ships a **self-contained interactive map** of the whole constellation
+at [`docs/index.html`](docs/index.html) — coastlines and all ~10,000 satellites,
+colored by decay risk, in a single HTML file with **no external requests**
+(works on any network, including one that blocks CDNs). GitHub can host it as a
+public web page straight from the repo:
+
+1. In the repo on GitHub, open **Settings ▸ Pages**.
+2. Under **Build and deployment ▸ Source**, choose **GitHub Actions**.
+3. That's it — the included workflow ([`.github/workflows/pages.yml`](.github/workflows/pages.yml))
+   publishes `docs/` on every push. When it finishes (Actions tab), your public
+   URL appears at **Settings ▸ Pages**, typically:
+   `https://alexander-maldonado-pelayo.github.io/Starlink-Tracker-/`
+
+Send that URL to anyone — it opens in any browser with no login and no install.
+
+> Prefer not to use Actions? Under **Settings ▸ Pages ▸ Source** pick
+> **Deploy from a branch**, choose this branch and the **`/docs`** folder.
+
+To regenerate the page from the current data (after a `spacetrack update` or
+`spacetrack scan`):
+
+```bash
+python scripts/build_pages.py     # rewrites docs/index.html, then commit + push
+```
+
+The Pages map is a static snapshot. For a link that's *interactive* end-to-end
+(all eight tabs, live re-propagation), deploy the full app to Streamlit Cloud
+below.
+
 ## Share a link so others can access it
 
 To hand someone a URL they can open in a browser — no install, no laptop of
