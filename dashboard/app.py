@@ -95,13 +95,18 @@ log = logging.getLogger(__name__)
 try:
     for _key in (
         "SPACETRACK_IDENTITY", "SPACETRACK_PASSWORD",
-        "TURSO_URL", "TURSO_AUTH_TOKEN",
+        "TURSO_URL", "TURSO_AUTH_TOKEN", "STARLINK_WATCH_SEED_ONLY",
     ):
         _val = st.secrets.get(_key) if hasattr(st, "secrets") else None
         if _val and not os.environ.get(_key):
-            os.environ[_key] = _val
+            os.environ[_key] = str(_val)
 except Exception:  # noqa: BLE001 — secrets backend not configured locally is fine
     pass
+
+
+def _env_truthy(name: str) -> bool:
+    """True when an env var is set to a truthy string (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 # ---------------------------------------------------------------------------
 # Data loaders (cached so propagation isn't re-run every Streamlit interaction)
@@ -174,6 +179,22 @@ def bootstrap_catalog_if_empty() -> None:
             "catalog ▸ Run workflow."
         )
         st.stop()
+
+    # Demo / offline deploy: skip the live fetch entirely and boot straight
+    # from the bundled snapshot. Set STARLINK_WATCH_SEED_ONLY=1 (env var, or a
+    # Streamlit Cloud secret) for a fast, reliable, zero-config public deploy
+    # on a network that can't reach CelesTrak.
+    if _env_truthy("STARLINK_WATCH_SEED_ONLY"):
+        with st.spinner("Loading the bundled Starlink snapshot..."):
+            tles = load_bundled_seed()
+            with db.session(DB_PATH) as conn:
+                new_count, total = write_snapshots(
+                    conn, tles, fetched_at=now_unix(), constellation="starlink"
+                )
+        log.info("Bootstrap source=bundled-seed (SEED_ONLY) persisted=%d/%d", new_count, total)
+        db_stats.clear()
+        load_all_tles.clear()
+        return
 
     tles = None
     source: str | None = None

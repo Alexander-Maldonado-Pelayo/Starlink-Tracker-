@@ -78,6 +78,62 @@ seven tabs still work fully from the bundled snapshot.
 
 ---
 
+## Share a link so others can access it
+
+To hand someone a URL they can open in a browser — no install, no laptop of
+yours required — deploy to **[Streamlit Community Cloud](https://share.streamlit.io)**
+(free). This repo is already set up for it.
+
+1. Make sure this repo is pushed to your GitHub (it is, on your working branch).
+2. Go to **[share.streamlit.io](https://share.streamlit.io)** and sign in with GitHub.
+3. **New app** → pick this repository, the branch, and set the main file to
+   `dashboard/app.py`.
+4. Open **Advanced settings ▸ Secrets** and add one line so the deploy boots
+   instantly from the bundled snapshot instead of depending on outbound
+   network access:
+   ```toml
+   STARLINK_WATCH_SEED_ONLY = "1"
+   ```
+5. **Deploy.** You'll get a public `https://<your-app>.streamlit.app` URL to
+   send along.
+
+Notes:
+- With `STARLINK_WATCH_SEED_ONLY = "1"` the app serves the committed
+  ~10,000-satellite snapshot — reliable and fast, ideal for a demo link.
+- Drop that secret and the deploy will instead pull **live** TLEs from
+  CelesTrak on first load (when its network can reach CelesTrak).
+- For a link that stays continuously current *and* accumulates a real anomaly
+  timeline, follow the **Production deploy (Turso + scheduled refresh)** section
+  in the [README](README.md#production-deploy-turso--scheduled-refresh).
+
+## Populate the Maneuvers & Inspector tabs (real history)
+
+The **Maneuvers** and **Inspector** detectors compare orbital elements across
+*multiple* TLE epochs, so they need history — a single snapshot leaves them
+empty. To light them up with genuine detected events (the credible thing to
+show a technical audience), backfill real history from
+[Space-Track.org](https://www.space-track.org) (free account):
+
+```bash
+# One-time: set your Space-Track credentials
+export SPACETRACK_IDENTITY="you@example.com"     # Windows: $env:SPACETRACK_IDENTITY="..."
+export SPACETRACK_PASSWORD="your-password"        # Windows: $env:SPACETRACK_PASSWORD="..."
+
+# Pull a week of real Starlink TLE history, then run the detectors
+spacetrack backfill 2026-07-08 --days 7
+spacetrack scan
+
+# Launch (or refresh) the dashboard — Maneuvers, Inspector, and the
+# Anomaly Feed are now populated with real events
+spacetrack dashboard
+```
+
+Starlink maneuvers constantly for station-keeping, so a week of history
+surfaces plenty of real boosts, drops, and element residuals. Running
+`spacetrack update` on a schedule (see
+[`scripts/register_scheduled_update.ps1`](scripts/register_scheduled_update.ps1))
+keeps that history growing over time.
+
 ## Notes
 
 - The bundled snapshot is a single point in time, so the **Maneuvers** and
